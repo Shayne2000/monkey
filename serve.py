@@ -167,6 +167,7 @@ class Factory(GstRtspServer.RTSPMediaFactory):
             frame = latest_frame.copy()
 
         frame = cv2.resize(frame, (W, H))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2BGR)  # กัน weird format
 
         data = frame.tobytes()
 
