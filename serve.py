@@ -29,13 +29,15 @@ frame_lock = threading.Lock()
 # NVDEC INPUT
 # =============================
 def build_input(url):
-    return (
-        f"rtspsrc location={url} latency=0 drop-on-latency=true ! "
-        f"rtph264depay ! h264parse ! nvv4l2decoder ! "
-        f"nvvidconv ! video/x-raw,format=BGRx ! "
-        f"videoconvert ! video/x-raw,format=BGR ! "
-        f"appsink drop=1 sync=false"
+    pipeline = (
+        "rtspsrc location=" + url + " latency=0 drop-on-latency=true ! "
+        "rtph264depay ! h264parse ! "
+        "nvv4l2decoder ! "
+        "nvvidconv ! video/x-raw,format=BGRx ! "
+        "videoconvert ! "
+        "appsink drop=1 sync=false"
     )
+    return pipeline
 
 # =============================
 # MERGE BOX
