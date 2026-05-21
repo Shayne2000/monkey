@@ -123,7 +123,7 @@ def camera_loop():
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
         with frame_lock:
-            latest_frame = frame.copy()
+            latest_frame = frame
 
 # =============================
 # RTSP SERVER
@@ -135,18 +135,13 @@ class Factory(GstRtspServer.RTSPMediaFactory):
         self.set_shared(True)
 
         self.launch = (
-            "appsrc name=source is-live=true block=true format=time "
+            "appsrc name=source is-live=true block=true format=GST_FORMAT_TIME "
             f"caps=video/x-raw,format=BGR,width={W},height={H},framerate={FPS}/1 ! "
-
             "videoconvert ! "
             "video/x-raw,format=NV12 ! "
-
-            "nvvidconv ! "
-            "video/x-raw(memory:NVMM),format=NV12 ! "
-
+            "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
             "nvv4l2h264enc bitrate=2000000 insert-sps-pps=true maxperf-enable=1 ! "
-            "h264parse ! "
-            "rtph264pay config-interval=1 pt=96 name=pay0"
+            "h264parse ! rtph264pay name=pay0 pt=96 config-interval=1"
         )
 
         self.frame_id = 0
@@ -172,10 +167,8 @@ class Factory(GstRtspServer.RTSPMediaFactory):
         buf = Gst.Buffer.new_allocate(None, frame.nbytes, None)
         buf.fill(0, frame.tobytes())
 
-        duration = Gst.SECOND // FPS
-
-        buf.duration = duration
-        buf.pts = buf.dts = self.frame_id * duration
+        buf.pts = buf.dts = int(self.frame_id * Gst.SECOND / FPS)
+        buf.duration = int(Gst.SECOND / FPS)
         buf.offset = self.frame_id
 
         self.frame_id += 1
