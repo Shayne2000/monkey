@@ -84,7 +84,10 @@ def camera_loop():
 
     print("[INFO] Camera started")
 
+    print("check point weired")
+
     while True:
+        print("in while true")
         ret, frame = cap.read()
         if not ret:
             time.sleep(1)
@@ -122,6 +125,7 @@ def camera_loop():
         for x, y, w, h in merged:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
+        print("hello??")
         with frame_lock:
             latest_frame = frame
 
