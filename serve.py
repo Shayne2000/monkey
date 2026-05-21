@@ -156,7 +156,7 @@ class Factory(GstRtspServer.RTSPMediaFactory):
     def on_need_data(self, src, length):
         global latest_frame
 
-        print("push frame")
+        print("push frame2")
 
         with frame_lock:
             if latest_frame is None:
