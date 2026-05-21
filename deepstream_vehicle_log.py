@@ -237,9 +237,7 @@ class DeepStreamVehicleLogger:
         onnx_path = os.path.abspath(self.args.yolo_model)
         labels_path = os.path.abspath(self.args.labels)
         parser_path = os.path.abspath(self.args.custom_parser)
-        engine_path = os.path.abspath(self.args.engine_file or os.path.join(
-            "models", "yolo_b%d_gpu0_fp16.engine" % batch_size
-        ))
+        engine_path = os.path.abspath(self.args.engine_file) if self.args.engine_file else ""
         config_path = os.path.join(generated_dir, "config_infer_primary_yolo_b%d.txt" % batch_size)
 
         if not os.path.exists(parser_path):
@@ -255,7 +253,6 @@ class DeepStreamVehicleLogger:
             "gpu-id=0",
             "net-scale-factor=0.0039215697906911373",
             "onnx-file=%s" % onnx_path,
-            "model-engine-file=%s" % engine_path,
             "labelfile-path=%s" % labels_path,
             "infer-dims=3;%d;%d" % (self.args.infer_size, self.args.infer_size),
             "network-mode=2",
@@ -279,6 +276,8 @@ class DeepStreamVehicleLogger:
             "nms-iou-threshold=%.4f" % self.args.nms_iou_threshold,
             "",
         ]
+        if engine_path:
+            lines.insert(4, "model-engine-file=%s" % engine_path)
         with open(config_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
         return config_path
