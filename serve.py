@@ -77,7 +77,7 @@ def camera_loop():
 
     def open_cap():
         print("[INFO] opening RTSP...")
-        cap = cv2.VideoCapture(build_input(rtsp_in), cv2.CAP_GSTREAMER)
+        cap = cv2.VideoCapture(rtsp_in, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
