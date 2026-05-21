@@ -31,6 +31,7 @@ from gi.repository import GLib, Gst
 log = logging.getLogger("robust_rtsp_relay")
 Gst.init(None)
 DEFAULT_CROP_EXPAND = 1.8
+VEHICLE_CLASS_IDS = {2, 3, 5, 7}
 
 
 def gst_element_exists(factory_name: str) -> bool:
@@ -513,6 +514,185 @@ class JsonlWriter:
             self._fh.close()
 
 
+def load_label_map(path: str, section: str) -> Dict[int, str]:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    labels = data.get(section, data)
+    return {int(k): str(v) for k, v in labels.items()}
+
+
+def softmax(values: np.ndarray) -> np.ndarray:
+    values = values.astype(np.float32)
+    values = values - np.max(values)
+    exp = np.exp(values)
+    return exp / max(float(np.sum(exp)), 1e-12)
+
+
+def normalize_model_output(output) -> np.ndarray:
+    if isinstance(output, (list, tuple)):
+        output = output[0]
+    arr = np.asarray(output)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim != 2:
+        return np.empty((0, 0), dtype=np.float32)
+    if arr.shape[0] < arr.shape[1] and arr.shape[0] <= 128:
+        arr = arr.T
+    return arr.astype(np.float32)
+
+
+class VehicleModelPipeline:
+    """Runs YOLO detection and brand classification only on motion crops."""
+
+    def __init__(
+        self,
+        *,
+        yolo_model: str,
+        classifier_model: str,
+        labels_path: str,
+        yolo_size: int,
+        classifier_size: int,
+        confidence: float,
+        nms_threshold: float,
+    ) -> None:
+        self.yolo_labels = load_label_map(labels_path, "yolo")
+        self.classifier_labels = load_label_map(labels_path, "classifier")
+        self.yolo_label_ids = sorted(self.yolo_labels)
+        self.yolo_size = yolo_size
+        self.classifier_size = classifier_size
+        self.confidence = confidence
+        self.nms_threshold = nms_threshold
+        self.yolo = cv2.dnn.readNetFromONNX(yolo_model)
+        self.classifier = cv2.dnn.readNetFromONNX(classifier_model)
+        self._lock = threading.Lock()
+
+    @classmethod
+    def maybe_create(cls, args):
+        if not args.enable_models:
+            return None
+        missing = [
+            path for path in (args.yolo_model, args.classifier_model, args.labels)
+            if not os.path.exists(path)
+        ]
+        if missing:
+            raise FileNotFoundError("model pipeline files missing: " + ", ".join(missing))
+        return cls(
+            yolo_model=args.yolo_model,
+            classifier_model=args.classifier_model,
+            labels_path=args.labels,
+            yolo_size=args.yolo_size,
+            classifier_size=args.classifier_size,
+            confidence=args.model_confidence,
+            nms_threshold=args.nms_threshold,
+        )
+
+    def detect_and_classify(self, frame, motion_box: Tuple[int, int, int, int]) -> List[dict]:
+        x, y, w, h = motion_box
+        crop = frame[y:y + h, x:x + w]
+        if crop.size == 0:
+            return []
+
+        detections = self._detect_vehicles(crop)
+        results = []
+        for det in detections:
+            dx, dy, dw, dh = det["box"]
+            fx = max(0, min(frame.shape[1] - 1, x + dx))
+            fy = max(0, min(frame.shape[0] - 1, y + dy))
+            fw = max(1, min(frame.shape[1] - fx, dw))
+            fh = max(1, min(frame.shape[0] - fy, dh))
+            vehicle_crop = frame[fy:fy + fh, fx:fx + fw]
+            brand, brand_confidence = self._classify_brand(vehicle_crop)
+            det.update({
+                "box": (fx, fy, fw, fh),
+                "brand": brand,
+                "brand_confidence": brand_confidence,
+            })
+            results.append(det)
+        return results
+
+    def _detect_vehicles(self, crop) -> List[dict]:
+        img_size = self.yolo_size
+        height, width = crop.shape[:2]
+        blob = cv2.dnn.blobFromImage(
+            crop,
+            scalefactor=1.0 / 255.0,
+            size=(img_size, img_size),
+            swapRB=True,
+            crop=False,
+        )
+        with self._lock:
+            self.yolo.setInput(blob)
+            output = self.yolo.forward()
+
+        rows = normalize_model_output(output)
+        boxes = []
+        confidences = []
+        class_ids = []
+        for row in rows:
+            if row.shape[0] < 5:
+                continue
+            scores = row[4:]
+            if scores.size == 0:
+                continue
+            class_id = int(np.argmax(scores))
+            label_id = self._resolve_yolo_label_id(class_id, scores.size)
+            confidence = float(scores[class_id])
+            if label_id is None or label_id not in VEHICLE_CLASS_IDS or confidence < self.confidence:
+                continue
+            cx, cy, bw, bh = [float(v) for v in row[:4]]
+            left = int(round((cx - bw / 2.0) * width / img_size))
+            top = int(round((cy - bh / 2.0) * height / img_size))
+            box_w = int(round(bw * width / img_size))
+            box_h = int(round(bh * height / img_size))
+            left = max(0, min(left, width - 1))
+            top = max(0, min(top, height - 1))
+            box_w = max(1, min(box_w, width - left))
+            box_h = max(1, min(box_h, height - top))
+            boxes.append([left, top, box_w, box_h])
+            confidences.append(confidence)
+            class_ids.append(label_id)
+
+        keep = cv2.dnn.NMSBoxes(boxes, confidences, self.confidence, self.nms_threshold)
+        if len(keep) == 0:
+            return []
+        indices = np.array(keep).reshape(-1).tolist()
+        return [
+            {
+                "box": tuple(int(v) for v in boxes[i]),
+                "vehicle_type": self.yolo_labels.get(class_ids[i], str(class_ids[i])),
+                "type_confidence": float(confidences[i]),
+            }
+            for i in indices
+        ]
+
+    def _resolve_yolo_label_id(self, class_id: int, score_count: int) -> Optional[int]:
+        if class_id in self.yolo_labels:
+            return class_id
+        if score_count == len(self.yolo_label_ids) and 0 <= class_id < len(self.yolo_label_ids):
+            return self.yolo_label_ids[class_id]
+        return None
+
+    def _classify_brand(self, crop) -> Tuple[Optional[str], Optional[float]]:
+        if crop.size == 0:
+            return None, None
+        img_size = self.classifier_size
+        blob = cv2.dnn.blobFromImage(
+            crop,
+            scalefactor=1.0 / 255.0,
+            size=(img_size, img_size),
+            swapRB=True,
+            crop=False,
+        )
+        with self._lock:
+            self.classifier.setInput(blob)
+            output = np.asarray(self.classifier.forward()).reshape(-1)
+        if output.size == 0:
+            return None, None
+        probs = output if 0.99 <= float(np.sum(output)) <= 1.01 else softmax(output)
+        class_id = int(np.argmax(probs))
+        return self.classifier_labels.get(class_id, str(class_id)), float(probs[class_id])
+
+
 def detect_motion_regions(
     frame,
     prev_gray,
@@ -625,6 +805,11 @@ def build_vehicle_log_event(
     track_id: str,
     camera_id: str,
     box: Tuple[int, int, int, int],
+    vehicle_type: Optional[str] = None,
+    brand: Optional[str] = None,
+    event_type: str = "motion",
+    type_confidence: Optional[float] = None,
+    brand_confidence: Optional[float] = None,
 ) -> dict:
     x, y, w, h = box
     return {
@@ -632,18 +817,18 @@ def build_vehicle_log_event(
         "track_id": track_id,
         "camera_id": camera_id,
         "last_seen": detected_at,
-        "vehicle_type": None,
+        "vehicle_type": vehicle_type,
         "color": None,
-        "brand": None,
+        "brand": brand,
         "plate": None,
         "position_x": float(x + w / 2.0),
         "position_y": float(y + h / 2.0),
         "bbox_width": float(w),
         "bbox_height": float(h),
-        "event_type": "motion",
-        "type_confidence": None,
+        "event_type": event_type,
+        "type_confidence": type_confidence,
         "color_confidence": None,
-        "brand_confidence": None,
+        "brand_confidence": brand_confidence,
     }
 
 
@@ -661,6 +846,7 @@ def camera_loop(
     merge_distance: float,
     motion_width: int,
     blur_kernel: int,
+    model_pipeline: Optional[VehicleModelPipeline] = None,
     writer: Optional[JsonlWriter] = None,
 ) -> None:
     reader: Optional[GstFrameReader] = None
@@ -677,6 +863,8 @@ def camera_loop(
     read_ms_max = 0.0
     motion_ms_total = 0.0
     motion_ms_max = 0.0
+    model_ms_total = 0.0
+    model_ms_max = 0.0
     write_ms_total = 0.0
     write_ms_max = 0.0
     prev_gray = None
@@ -745,23 +933,48 @@ def camera_loop(
                     motion_ms_max = motion_ms
                 detected_at = utc_now_iso()
                 for box in boxes:
-                    x, y, w, h = box
-                    cx = x + w / 2.0
-                    cy = y + h / 2.0
-                    track_id = tracker.assign(cx, cy, frames_processed)
-                    write_start = time.monotonic()
-                    writer.write(build_vehicle_log_event(
-                        detected_at=detected_at,
-                        track_id=track_id,
-                        camera_id=camera_id,
-                        box=box,
-                    ))
-                    write_ms = (time.monotonic() - write_start) * 1000.0
-                    write_ms_total += write_ms
-                    if write_ms > write_ms_max:
-                        write_ms_max = write_ms
-                    events_written += 1
-                    fps_window_events += 1
+                    detections = []
+                    if model_pipeline is not None:
+                        model_start = time.monotonic()
+                        detections = model_pipeline.detect_and_classify(frame, box)
+                        model_ms = (time.monotonic() - model_start) * 1000.0
+                        model_ms_total += model_ms
+                        if model_ms > model_ms_max:
+                            model_ms_max = model_ms
+
+                    event_items = detections or [{
+                        "box": box,
+                        "vehicle_type": None,
+                        "brand": None,
+                        "event_type": "motion",
+                        "type_confidence": None,
+                        "brand_confidence": None,
+                    }]
+
+                    for item in event_items:
+                        event_box = item["box"]
+                        x, y, w, h = event_box
+                        cx = x + w / 2.0
+                        cy = y + h / 2.0
+                        track_id = tracker.assign(cx, cy, frames_processed)
+                        write_start = time.monotonic()
+                        writer.write(build_vehicle_log_event(
+                            detected_at=detected_at,
+                            track_id=track_id,
+                            camera_id=camera_id,
+                            box=event_box,
+                            vehicle_type=item.get("vehicle_type"),
+                            brand=item.get("brand"),
+                            event_type=item.get("event_type", "vehicle_detected"),
+                            type_confidence=item.get("type_confidence"),
+                            brand_confidence=item.get("brand_confidence"),
+                        ))
+                        write_ms = (time.monotonic() - write_start) * 1000.0
+                        write_ms_total += write_ms
+                        if write_ms > write_ms_max:
+                            write_ms_max = write_ms
+                        events_written += 1
+                        fps_window_events += 1
 
             now = time.monotonic()
             if now - fps_window_start >= 1.0:
@@ -770,14 +983,17 @@ def camera_loop(
                 read_avg = read_ms_total / max(fps_window_frames, 1)
                 motion_avg = motion_ms_total / max(fps_window_processed, 1)
                 write_avg = write_ms_total / max(fps_window_events, 1)
+                model_avg = model_ms_total / max(fps_window_events, 1)
                 log.info(
                     "[%s] fps=%.2f read_avg_ms=%.1f read_max_ms=%.1f "
                     "motion_avg_ms=%.1f motion_max_ms=%.1f "
+                    "model_avg_ms=%.1f model_max_ms=%.1f "
                     "write_avg_ms=%.3f write_max_ms=%.3f "
                     "frames_read=%d processed=%d events=%d events_window=%d",
                     camera_id, fps,
                     read_avg, read_ms_max,
                     motion_avg, motion_ms_max,
+                    model_avg, model_ms_max,
                     write_avg, write_ms_max,
                     frames_read, frames_processed, events_written, fps_window_events,
                 )
@@ -789,6 +1005,8 @@ def camera_loop(
                 read_ms_max = 0.0
                 motion_ms_total = 0.0
                 motion_ms_max = 0.0
+                model_ms_total = 0.0
+                model_ms_max = 0.0
                 write_ms_total = 0.0
                 write_ms_max = 0.0
     finally:
@@ -808,6 +1026,10 @@ def default_camera_urls(prefix: str, start: int, count: int) -> List[Tuple[str, 
 def run_multi_camera(args) -> None:
     cameras = default_camera_urls(args.rtsp_prefix, args.camera_start, args.camera_count)
     writer = JsonlWriter(args.event_log)
+    model_pipeline = VehicleModelPipeline.maybe_create(args)
+    if model_pipeline is not None:
+        log.info("model pipeline enabled: yolo=%s classifier=%s labels=%s",
+                 args.yolo_model, args.classifier_model, args.labels)
     threads = []
 
     log.info("starting %d cameras", len(cameras))
@@ -827,6 +1049,7 @@ def run_multi_camera(args) -> None:
                 "merge_distance": args.merge_distance,
                 "motion_width": args.motion_width,
                 "blur_kernel": args.blur_kernel,
+                "model_pipeline": model_pipeline,
                 "writer": writer,
             },
             name=f"camera-{camera_id}",
@@ -862,6 +1085,15 @@ def main() -> int:
     parser.add_argument("--merge-distance", type=float, default=350.0)
     parser.add_argument("--motion-width", type=int, default=480)
     parser.add_argument("--blur-kernel", type=int, default=5)
+    parser.add_argument("--no-models", dest="enable_models", action="store_false")
+    parser.set_defaults(enable_models=True)
+    parser.add_argument("--yolo-model", default="models/yolo.onnx")
+    parser.add_argument("--classifier-model", default="models/classifier.onnx")
+    parser.add_argument("--labels", default="models/labels.json")
+    parser.add_argument("--yolo-size", type=int, default=640)
+    parser.add_argument("--classifier-size", type=int, default=224)
+    parser.add_argument("--model-confidence", type=float, default=0.25)
+    parser.add_argument("--nms-threshold", type=float, default=0.45)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -872,6 +1104,10 @@ def main() -> int:
 
     try:
         if args.single_camera:
+            model_pipeline = VehicleModelPipeline.maybe_create(args)
+            if model_pipeline is not None:
+                log.info("model pipeline enabled: yolo=%s classifier=%s labels=%s",
+                         args.yolo_model, args.classifier_model, args.labels)
             camera_loop(
                 rtsp_url=args.input,
                 camera_id=args.camera_id,
@@ -885,6 +1121,7 @@ def main() -> int:
                 merge_distance=args.merge_distance,
                 motion_width=args.motion_width,
                 blur_kernel=args.blur_kernel,
+                model_pipeline=model_pipeline,
             )
         else:
             run_multi_camera(args)

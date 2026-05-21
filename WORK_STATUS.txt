@@ -1,0 +1,57 @@
+Work status - RTSP motion gate + vehicle model pipeline
+
+Current branch:
+- codex/rtsp-relay-starter
+
+What was added in this round:
+- robust_rtsp_relay.py now has a VehicleModelPipeline skeleton using OpenCV DNN.
+- The intended flow is:
+  1. Read RTSP frames using the existing Jetson/GStreamer reader.
+  2. Run lightweight 2-frame motion detection.
+  3. Expand motion boxes into larger square crops for higher recall.
+  4. Run YOLO only on motion crops.
+  5. Run the classifier on detected vehicle crops.
+  6. Write vehicle_log-shaped JSONL events with vehicle_type and brand when available.
+- The model paths are configurable:
+  --yolo-model models/yolo.onnx
+  --classifier-model models/classifier.onnx
+  --labels models/labels.json
+- Models can be disabled with:
+  --no-models
+
+Files provided by user:
+- C:\Users\Shayne\Downloads\yolo.onnx
+- C:\Users\Shayne\Downloads\classifier.onnx
+- C:\Users\Shayne\Downloads\labels.json
+
+Labels seen:
+- YOLO vehicle labels:
+  2=car, 3=motorcycle, 5=bus, 7=truck
+- Classifier brand labels:
+  BYD, Ford, GWM, Honda, Isuzu, MG, Mitsubishi, Toyota
+
+Important runtime notes:
+- The new model pipeline uses cv2.dnn.readNetFromONNX, not DeepStream nvinfer yet.
+- This is deliberate because the Jetson environment previously had missing/unstable DeepStream plugins.
+- On Jetson, confirm OpenCV DNN can load both ONNX files.
+- If OpenCV DNN cannot load them, the next path is ONNX Runtime or a proper DeepStream nvinfer integration.
+
+Potential issue to verify next:
+- Confirm the YOLO output shape and class indexing.
+- The code supports normal COCO ids 2/3/5/7 and also a compact 4-class output if the output class count matches labels.json.
+- Classifier preprocessing may need mean/std normalization depending on how classifier.onnx was trained.
+- Current classifier preprocessing is simple RGB resize + scale 1/255.
+
+Recommended next steps:
+1. Copy yolo.onnx, classifier.onnx, and labels.json into monkey/models on the Jetson.
+2. Run syntax/import check:
+   python3 -m py_compile robust_rtsp_relay.py
+3. Run one camera first:
+   python3 robust_rtsp_relay.py --single-camera --input rtsp://10.0.11.153:8554/cctv02 --camera-id cctv02
+4. Watch terminal logs for model_avg_ms and events_window.
+5. Check vehicle_log.jsonl to see whether vehicle_type and brand are populated.
+6. If model load fails, capture the exact OpenCV error and inspect ONNX compatibility.
+
+Do not forget:
+- The large ONNX files may be better handled by Git LFS or copied manually to Jetson instead of committing directly to GitHub.
+- DeepStream zip content remains a reference for a later nvinfer implementation, but current code keeps the lighter motion-gated OpenCV DNN path.
