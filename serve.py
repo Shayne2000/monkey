@@ -73,6 +73,8 @@ def adaptive_merge(boxes, dist_th=180):
 def camera_loop():
     global latest_frame
 
+    print("push frame")
+
     cap = cv2.VideoCapture(build_input(rtsp_in), cv2.CAP_GSTREAMER)
 
     prev = None
