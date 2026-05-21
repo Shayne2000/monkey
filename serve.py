@@ -134,11 +134,18 @@ class Factory(GstRtspServer.RTSPMediaFactory):
         self.set_shared(True)
 
         self.launch = (
-            f"appsrc name=source is-live=true block=true format=GST_FORMAT_TIME "
-            f"caps=video/x-raw,format=BGRx,width={W},height={H},framerate={FPS}/1 ! "
-            f"videoconvert ! nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
-            f"nvv4l2h264enc bitrate=2000000 insert-sps-pps=true ! "
-            f"h264parse ! rtph264pay name=pay0 pt=96 config-interval=1"
+            "appsrc name=source is-live=true block=true format=GST_FORMAT_TIME "
+            f"caps=video/x-raw,format=BGR,width={W},height={H},framerate={FPS}/1 ! "
+            
+            "videoconvert ! "
+            "video/x-raw,format=NV12 ! "
+            
+            "nvvidconv ! "
+            "video/x-raw(memory:NVMM),format=NV12 ! "
+            
+            "nvv4l2h264enc bitrate=2000000 insert-sps-pps=true ! "
+            "h264parse ! "
+            "rtph264pay config-interval=1 pt=96 name=pay0"
         )
 
         self.frame_duration = int(1e9 / FPS)
