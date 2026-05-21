@@ -132,11 +132,11 @@ class Factory(GstRtspServer.RTSPMediaFactory):
         self.set_shared(True)
 
         self.launch = (
-            f"appsrc name=source is-live=true format=GST_FORMAT_TIME "
-            f"caps=video/x-raw,format=BGR,width={W},height={H},framerate={FPS}/1 ! "
-            f"videoconvert ! nvvidconv ! "
+            f"appsrc name=source is-live=true block=true format=GST_FORMAT_TIME "
+            f"caps=video/x-raw,format=BGRx,width={W},height={H},framerate={FPS}/1 ! "
+            f"videoconvert ! nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
             f"nvv4l2h264enc bitrate=2000000 insert-sps-pps=true ! "
-            f"h264parse ! rtph264pay name=pay0 pt=96"
+            f"h264parse ! rtph264pay name=pay0 pt=96 config-interval=1"
         )
 
         self.frame_duration = int(1e9 / FPS)
@@ -184,6 +184,7 @@ if __name__ == "__main__":
 
     server = GstRtspServer.RTSPServer()
     server.set_service(rtsp_port)
+    server.set_address("0.0.0.0")
 
     factory = Factory()
     server.get_mount_points().add_factory(rtsp_mount, factory)
