@@ -502,12 +502,15 @@ class JsonlWriter:
         if directory:
             os.makedirs(directory, exist_ok=True)
         self._fh = open(path, "a", buffering=1)
+        self._lock = threading.Lock()
 
     def write(self, event: dict) -> None:
-        self._fh.write(json.dumps(event, separators=(",", ":")) + "\n")
+        with self._lock:
+            self._fh.write(json.dumps(event, separators=(",", ":")) + "\n")
 
     def close(self) -> None:
-        self._fh.close()
+        with self._lock:
+            self._fh.close()
 
 
 def detect_motion_regions(
@@ -658,6 +661,7 @@ def camera_loop(
     merge_distance: float,
     motion_width: int,
     blur_kernel: int,
+    writer: Optional[JsonlWriter] = None,
 ) -> None:
     reader: Optional[GstFrameReader] = None
     fail_count = 0
@@ -677,7 +681,9 @@ def camera_loop(
     write_ms_max = 0.0
     prev_gray = None
     tracker = CentroidTracker(max_distance=merge_distance, max_missing_frames=30)
-    writer = JsonlWriter(event_log_path)
+    owns_writer = writer is None
+    if writer is None:
+        writer = JsonlWriter(event_log_path)
 
     try:
         while True:
@@ -690,7 +696,7 @@ def camera_loop(
                     time.sleep(backoff_s)
                     backoff_s = min(backoff_s * 2, 5.0)
                     continue
-                log.info("input reader ready camera_id=%s", camera_id)
+                log.info("[%s] input reader ready", camera_id)
                 fail_count = 0
                 backoff_s = 0.5
 
@@ -700,9 +706,9 @@ def camera_loop(
             if not ok or frame is None:
                 fail_count += 1
                 if fail_count % 10 == 0:
-                    log.warning("input frame read failed count=%d", fail_count)
+                    log.warning("[%s] input frame read failed count=%d", camera_id, fail_count)
                 if fail_count >= 30:
-                    log.warning("too many input failures; reconnecting")
+                    log.warning("[%s] too many input failures; reconnecting", camera_id)
                     reader.close()
                     reader = None
                     fail_count = 0
@@ -718,7 +724,7 @@ def camera_loop(
                 read_ms_max = read_ms
 
             if frames_read == 1 or frames_read % 100 == 0:
-                log.info("input frames read=%d shape=%s", frames_read, frame.shape)
+                log.info("[%s] input frames read=%d shape=%s", camera_id, frames_read, frame.shape)
 
             if frames_read % max(process_every_n, 1) == 0:
                 frames_processed += 1
@@ -765,11 +771,11 @@ def camera_loop(
                 motion_avg = motion_ms_total / max(fps_window_processed, 1)
                 write_avg = write_ms_total / max(fps_window_events, 1)
                 log.info(
-                    "fps=%.2f read_avg_ms=%.1f read_max_ms=%.1f "
+                    "[%s] fps=%.2f read_avg_ms=%.1f read_max_ms=%.1f "
                     "motion_avg_ms=%.1f motion_max_ms=%.1f "
                     "write_avg_ms=%.3f write_max_ms=%.3f "
                     "frames_read=%d processed=%d events=%d events_window=%d",
-                    fps,
+                    camera_id, fps,
                     read_avg, read_ms_max,
                     motion_avg, motion_ms_max,
                     write_avg, write_ms_max,
@@ -788,13 +794,64 @@ def camera_loop(
     finally:
         if reader is not None:
             reader.close()
+        if owns_writer:
+            writer.close()
+
+
+def default_camera_urls(prefix: str, start: int, count: int) -> List[Tuple[str, str]]:
+    return [
+        (f"cctv{i:02d}", f"{prefix.rstrip('/')}/cctv{i:02d}")
+        for i in range(start, start + count)
+    ]
+
+
+def run_multi_camera(args) -> None:
+    cameras = default_camera_urls(args.rtsp_prefix, args.camera_start, args.camera_count)
+    writer = JsonlWriter(args.event_log)
+    threads = []
+
+    log.info("starting %d cameras", len(cameras))
+    for camera_id, rtsp_url in cameras:
+        thread = threading.Thread(
+            target=camera_loop,
+            kwargs={
+                "rtsp_url": rtsp_url,
+                "camera_id": camera_id,
+                "latency_ms": args.latency_ms,
+                "input_width": args.input_width,
+                "input_height": args.input_height,
+                "event_log_path": args.event_log,
+                "process_every_n": args.process_every_n,
+                "min_area": args.min_area,
+                "density_threshold": args.density_threshold,
+                "merge_distance": args.merge_distance,
+                "motion_width": args.motion_width,
+                "blur_kernel": args.blur_kernel,
+                "writer": writer,
+            },
+            name=f"camera-{camera_id}",
+            daemon=True,
+        )
+        thread.start()
+        threads.append(thread)
+        time.sleep(args.camera_start_gap_sec)
+
+    try:
+        while True:
+            time.sleep(1.0)
+    finally:
         writer.close()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--single-camera", action="store_true")
     parser.add_argument("--input", default="rtsp://10.0.11.153:8554/cctv02")
     parser.add_argument("--camera-id", default="cctv02")
+    parser.add_argument("--rtsp-prefix", default="rtsp://10.0.11.153:8554")
+    parser.add_argument("--camera-start", type=int, default=1)
+    parser.add_argument("--camera-count", type=int, default=5)
+    parser.add_argument("--camera-start-gap-sec", type=float, default=1.0)
     parser.add_argument("--latency-ms", type=int, default=200)
     parser.add_argument("--input-width", type=int, default=640)
     parser.add_argument("--input-height", type=int, default=360)
@@ -814,20 +871,23 @@ def main() -> int:
     )
 
     try:
-        camera_loop(
-            rtsp_url=args.input,
-            camera_id=args.camera_id,
-            latency_ms=args.latency_ms,
-            input_width=args.input_width,
-            input_height=args.input_height,
-            event_log_path=args.event_log,
-            process_every_n=args.process_every_n,
-            min_area=args.min_area,
-            density_threshold=args.density_threshold,
-            merge_distance=args.merge_distance,
-            motion_width=args.motion_width,
-            blur_kernel=args.blur_kernel,
-        )
+        if args.single_camera:
+            camera_loop(
+                rtsp_url=args.input,
+                camera_id=args.camera_id,
+                latency_ms=args.latency_ms,
+                input_width=args.input_width,
+                input_height=args.input_height,
+                event_log_path=args.event_log,
+                process_every_n=args.process_every_n,
+                min_area=args.min_area,
+                density_threshold=args.density_threshold,
+                merge_distance=args.merge_distance,
+                motion_width=args.motion_width,
+                blur_kernel=args.blur_kernel,
+            )
+        else:
+            run_multi_camera(args)
     except KeyboardInterrupt:
         log.info("stopping")
     return 0
