@@ -50,16 +50,22 @@ class GstFrameReader:
 
     def start(self) -> bool:
         for source in self._source_candidates():
-            try:
-                self._build(source)
-                ret = self.pipeline.set_state(Gst.State.PLAYING)
-                if ret == Gst.StateChangeReturn.FAILURE:
-                    raise RuntimeError("set_state(PLAYING) failed")
-                log.info("input RTSP connected via %s", source)
-                return True
-            except Exception as exc:
-                log.warning("GStreamer input open failed via %s: %r", source, exc)
-                self.close()
+            for converter in self._converter_candidates():
+                try:
+                    self._build(source, converter)
+                    ret = self.pipeline.set_state(Gst.State.PLAYING)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        raise RuntimeError("set_state(PLAYING) failed")
+                    log.info("input RTSP connected via %s + %s", source, converter)
+                    return True
+                except Exception as exc:
+                    log.warning(
+                        "GStreamer input open failed via %s + %s: %r",
+                        source,
+                        converter,
+                        exc,
+                    )
+                    self.close()
         return False
 
     def read(self, timeout_s: float = 1.0):
@@ -86,7 +92,16 @@ class GstFrameReader:
         candidates.append("uridecodebin")
         return candidates
 
-    def _build(self, source: str) -> None:
+    def _converter_candidates(self) -> List[str]:
+        candidates = []
+        if gst_element_exists("nvvideoconvert"):
+            candidates.append("nvvideoconvert")
+        if gst_element_exists("nvvidconv"):
+            candidates.append("nvvidconv")
+        candidates.append("videoconvert")
+        return candidates
+
+    def _build(self, source: str, converter: str) -> None:
         if source == "nvurisrcbin":
             source_part = (
                 f'nvurisrcbin uri="{self.uri}" drop-on-latency=true '
@@ -98,8 +113,8 @@ class GstFrameReader:
         pipeline_desc = (
             source_part
             + " ! queue max-size-buffers=1 leaky=downstream "
-            + " ! nvvideoconvert "
-            + " ! video/x-raw,format=RGBA "
+            + f" ! {converter} "
+            + " ! video/x-raw,format=BGRx "
             + " ! videoconvert "
             + " ! video/x-raw,format=BGR "
             + " ! appsink name=framesink emit-signals=true sync=false max-buffers=1 drop=true"
