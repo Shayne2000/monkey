@@ -118,9 +118,23 @@ def detect_motion_regions(
     min_area: float,
     density_threshold: float,
     merge_distance: float,
+    motion_width: int,
+    blur_kernel: int,
 ):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (21, 21), 0)
+    original_h, original_w = frame.shape[:2]
+    scale = 1.0
+    work = frame
+    if motion_width > 0 and original_w > motion_width:
+        scale = motion_width / float(original_w)
+        motion_height = max(1, int(round(original_h * scale)))
+        work = cv2.resize(frame, (motion_width, motion_height), interpolation=cv2.INTER_AREA)
+
+    kernel = max(3, int(blur_kernel))
+    if kernel % 2 == 0:
+        kernel += 1
+
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (kernel, kernel), 0)
 
     if prev_gray is None:
         return gray, []
@@ -134,7 +148,7 @@ def detect_motion_regions(
     candidate_boxes = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_area:
+        if area < min_area * scale * scale:
             continue
         x, y, w, h = cv2.boundingRect(cnt)
         roi = thresh[y:y + h, x:x + w]
@@ -142,7 +156,24 @@ def detect_motion_regions(
         if density > density_threshold:
             candidate_boxes.append((x, y, w, h))
 
-    return gray, adaptive_merge_boxes(candidate_boxes, merge_distance)
+    merged = adaptive_merge_boxes(candidate_boxes, merge_distance * scale)
+    if scale == 1.0:
+        return gray, merged
+
+    scaled_boxes = []
+    inv_scale = 1.0 / scale
+    for x, y, w, h in merged:
+        x1 = int(round(x * inv_scale))
+        y1 = int(round(y * inv_scale))
+        x2 = int(round((x + w) * inv_scale))
+        y2 = int(round((y + h) * inv_scale))
+        x1 = max(0, min(x1, original_w - 1))
+        y1 = max(0, min(y1, original_h - 1))
+        x2 = max(x1 + 1, min(x2, original_w))
+        y2 = max(y1 + 1, min(y2, original_h))
+        scaled_boxes.append((x1, y1, x2 - x1, y2 - y1))
+
+    return gray, scaled_boxes
 
 
 def build_vehicle_log_event(
@@ -182,6 +213,10 @@ def camera_loop(
     min_area: float,
     density_threshold: float,
     merge_distance: float,
+    motion_width: int,
+    blur_kernel: int,
+    display: bool,
+    display_width: int,
 ) -> None:
     cap: Optional[cv2.VideoCapture] = None
     fail_count = 0
@@ -202,6 +237,7 @@ def camera_loop(
     prev_gray = None
     tracker = CentroidTracker(max_distance=merge_distance, max_missing_frames=30)
     writer = JsonlWriter(event_log_path)
+    window_name = "motion-reader"
 
     try:
         while True:
@@ -255,6 +291,8 @@ def camera_loop(
                     min_area=min_area,
                     density_threshold=density_threshold,
                     merge_distance=merge_distance,
+                    motion_width=motion_width,
+                    blur_kernel=blur_kernel,
                 )
                 motion_ms = (time.monotonic() - motion_start) * 1000.0
                 motion_ms_total += motion_ms
@@ -279,6 +317,23 @@ def camera_loop(
                         write_ms_max = write_ms
                     events_written += 1
                     fps_window_events += 1
+
+                if display:
+                    preview = frame.copy()
+                    for x, y, w, h in boxes:
+                        cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    if display_width > 0 and preview.shape[1] > display_width:
+                        scale = display_width / float(preview.shape[1])
+                        display_height = max(1, int(round(preview.shape[0] * scale)))
+                        preview = cv2.resize(
+                            preview,
+                            (display_width, display_height),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    cv2.imshow(window_name, preview)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        log.info("display quit requested")
+                        break
 
             now = time.monotonic()
             if now - fps_window_start >= 1.0:
@@ -311,6 +366,8 @@ def camera_loop(
     finally:
         if cap is not None:
             cap.release()
+        if display:
+            cv2.destroyAllWindows()
         writer.close()
 
 
@@ -323,6 +380,10 @@ def main() -> int:
     parser.add_argument("--min-area", type=float, default=1000.0)
     parser.add_argument("--density-threshold", type=float, default=0.35)
     parser.add_argument("--merge-distance", type=float, default=350.0)
+    parser.add_argument("--motion-width", type=int, default=480)
+    parser.add_argument("--blur-kernel", type=int, default=5)
+    parser.add_argument("--display", action="store_true")
+    parser.add_argument("--display-width", type=int, default=960)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -340,6 +401,10 @@ def main() -> int:
             min_area=args.min_area,
             density_threshold=args.density_threshold,
             merge_distance=args.merge_distance,
+            motion_width=args.motion_width,
+            blur_kernel=args.blur_kernel,
+            display=args.display,
+            display_width=args.display_width,
         )
     except KeyboardInterrupt:
         log.info("stopping")
