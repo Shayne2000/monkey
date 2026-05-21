@@ -191,6 +191,14 @@ def camera_loop(
     events_written = 0
     fps_window_start = time.monotonic()
     fps_window_frames = 0
+    fps_window_processed = 0
+    fps_window_events = 0
+    read_ms_total = 0.0
+    read_ms_max = 0.0
+    motion_ms_total = 0.0
+    motion_ms_max = 0.0
+    write_ms_total = 0.0
+    write_ms_max = 0.0
     prev_gray = None
     tracker = CentroidTracker(max_distance=merge_distance, max_missing_frames=30)
     writer = JsonlWriter(event_log_path)
@@ -211,7 +219,9 @@ def camera_loop(
                 fail_count = 0
                 backoff_s = 0.5
 
+            read_start = time.monotonic()
             ok, frame = cap.read()
+            read_ms = (time.monotonic() - read_start) * 1000.0
             if not ok or frame is None:
                 fail_count += 1
                 if fail_count % 10 == 0:
@@ -228,12 +238,17 @@ def camera_loop(
             fail_count = 0
             frames_read += 1
             fps_window_frames += 1
+            read_ms_total += read_ms
+            if read_ms > read_ms_max:
+                read_ms_max = read_ms
 
             if frames_read == 1 or frames_read % 100 == 0:
                 log.info("input frames read=%d shape=%s", frames_read, frame.shape)
 
             if frames_read % max(process_every_n, 1) == 0:
                 frames_processed += 1
+                fps_window_processed += 1
+                motion_start = time.monotonic()
                 prev_gray, boxes = detect_motion_regions(
                     frame,
                     prev_gray,
@@ -241,29 +256,58 @@ def camera_loop(
                     density_threshold=density_threshold,
                     merge_distance=merge_distance,
                 )
+                motion_ms = (time.monotonic() - motion_start) * 1000.0
+                motion_ms_total += motion_ms
+                if motion_ms > motion_ms_max:
+                    motion_ms_max = motion_ms
                 detected_at = utc_now_iso()
                 for box in boxes:
                     x, y, w, h = box
                     cx = x + w / 2.0
                     cy = y + h / 2.0
                     track_id = tracker.assign(cx, cy, frames_processed)
+                    write_start = time.monotonic()
                     writer.write(build_vehicle_log_event(
                         detected_at=detected_at,
                         track_id=track_id,
                         camera_id=camera_id,
                         box=box,
                     ))
+                    write_ms = (time.monotonic() - write_start) * 1000.0
+                    write_ms_total += write_ms
+                    if write_ms > write_ms_max:
+                        write_ms_max = write_ms
                     events_written += 1
+                    fps_window_events += 1
 
             now = time.monotonic()
             if now - fps_window_start >= 1.0:
-                fps = fps_window_frames / (now - fps_window_start)
+                window_s = now - fps_window_start
+                fps = fps_window_frames / window_s
+                read_avg = read_ms_total / max(fps_window_frames, 1)
+                motion_avg = motion_ms_total / max(fps_window_processed, 1)
+                write_avg = write_ms_total / max(fps_window_events, 1)
                 log.info(
-                    "fps=%.2f frames_read=%d processed=%d events=%d",
-                    fps, frames_read, frames_processed, events_written,
+                    "fps=%.2f read_avg_ms=%.1f read_max_ms=%.1f "
+                    "motion_avg_ms=%.1f motion_max_ms=%.1f "
+                    "write_avg_ms=%.3f write_max_ms=%.3f "
+                    "frames_read=%d processed=%d events=%d events_window=%d",
+                    fps,
+                    read_avg, read_ms_max,
+                    motion_avg, motion_ms_max,
+                    write_avg, write_ms_max,
+                    frames_read, frames_processed, events_written, fps_window_events,
                 )
                 fps_window_start = now
                 fps_window_frames = 0
+                fps_window_processed = 0
+                fps_window_events = 0
+                read_ms_total = 0.0
+                read_ms_max = 0.0
+                motion_ms_total = 0.0
+                motion_ms_max = 0.0
+                write_ms_total = 0.0
+                write_ms_max = 0.0
     finally:
         if cap is not None:
             cap.release()
