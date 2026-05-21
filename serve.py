@@ -32,13 +32,13 @@ frame_lock = threading.Lock()
 def build_input(url):
     return (
         "rtspsrc location=" + url +
-        " protocols=tcp latency=800 ! "
+        " protocols=tcp latency=1000 drop-on-latency=false ! "
         "rtph264depay ! h264parse ! "
+        "queue max-size-buffers=10 max-size-time=0 max-size-bytes=0 leaky=no ! "
         "nvv4l2decoder ! nvvidconv ! "
         "video/x-raw,format=BGRx ! videoconvert ! "
         "video/x-raw,format=BGR ! "
-        "queue max-size-buffers=5 max-size-time=0 max-size-bytes=0 ! "
-        "appsink sync=true drop=false max-buffers=5"
+        "appsink sync=true drop=false max-buffers=10"
     )
 
 # =============================
