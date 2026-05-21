@@ -156,6 +156,8 @@ class Factory(GstRtspServer.RTSPMediaFactory):
     def on_need_data(self, src, length):
         global latest_frame
 
+        print("push frame")
+
         with frame_lock:
             if latest_frame is None:
                 return
@@ -187,7 +189,7 @@ if __name__ == "__main__":
 
     server = GstRtspServer.RTSPServer()
     server.set_service(rtsp_port)
-    server.set_address("0.0.0.0")
+    print()
 
     factory = Factory()
     server.get_mount_points().add_factory(rtsp_mount, factory)
