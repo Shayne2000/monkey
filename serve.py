@@ -157,6 +157,9 @@ class Factory(GstRtspServer.RTSPMediaFactory):
                 return
             frame = latest_frame.copy()
 
+        # 🔥 FIX: enforce FPS timing
+        time.sleep(1.0 / FPS)
+
         data = frame.tobytes()
 
         buf = Gst.Buffer.new_allocate(None, len(data), None)
