@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+vehicle_log.jsonl
+models/*.onnx
+models/*.engine
+models/*.pt

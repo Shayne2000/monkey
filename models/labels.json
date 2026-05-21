@@ -1,0 +1,18 @@
+{
+  "yolo": {
+    "2": "car",
+    "3": "motorcycle",
+    "5": "bus",
+    "7": "truck"
+  },
+  "classifier": {
+    "0": "BYD",
+    "1": "Ford",
+    "2": "GWM",
+    "3": "Honda",
+    "4": "Isuzu",
+    "5": "MG",
+    "6": "Mitsubishi",
+    "7": "Toyota"
+  }
+}

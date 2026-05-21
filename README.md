@@ -1,6 +1,8 @@
 # Monkey RTSP Motion Reader
 
-This branch contains a Jetson RTSP motion reader that writes `vehicle_log`-shaped JSONL events.
+Jetson RTSP reader with a lightweight 2-frame motion gate. When motion is found,
+the code can run YOLO detection and a brand classifier before writing
+`vehicle_log`-shaped JSONL events.
 
 ## Install base dependencies on Jetson
 
@@ -16,14 +18,39 @@ bash scripts/check_jetson_env.sh
 
 ## Run
 
+Copy model files onto the Jetson first:
+
+```bash
+mkdir -p models
+cp /path/to/yolo.onnx models/yolo.onnx
+cp /path/to/classifier.onnx models/classifier.onnx
+```
+
+`models/labels.json` is already tracked in this branch. Large model files are
+ignored by git.
+
+Check model loading:
+
+```bash
+python3 scripts/check_models.py
+```
+
+Run all 5 default cameras:
+
 ```bash
 python3 robust_rtsp_relay.py
 ```
 
-With preview on a Jetson display:
+Run only one camera:
 
 ```bash
-python3 robust_rtsp_relay.py --display
+python3 robust_rtsp_relay.py --single-camera --input rtsp://10.0.11.153:8554/cctv02 --camera-id cctv02
+```
+
+Disable model inference and log motion only:
+
+```bash
+python3 robust_rtsp_relay.py --no-models
 ```
 
 ## Important
@@ -31,3 +58,7 @@ python3 robust_rtsp_relay.py --display
 DeepStream plugins such as `nvstreammux`, `nvurisrcbin`, and `nvinfer` are NVIDIA system plugins. They do not come from pip or a copied `.venv`.
 
 Use `scripts/check_jetson_env.sh` to see what is missing.
+
+Current model inference uses OpenCV DNN (`cv2.dnn.readNetFromONNX`) after the
+motion gate. DeepStream `nvinfer` remains a later integration path if the Jetson
+runtime has the required plugins.
