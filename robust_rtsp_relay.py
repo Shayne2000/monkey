@@ -618,6 +618,7 @@ def camera_loop(
     blur_kernel: int,
     display: bool,
     display_width: int,
+    display_fps: float,
 ) -> None:
     reader: Optional[GstFrameReader] = None
     fail_count = 0
@@ -639,6 +640,21 @@ def camera_loop(
     tracker = CentroidTracker(max_distance=merge_distance, max_missing_frames=30)
     writer = JsonlWriter(event_log_path)
     window_name = "motion-reader"
+    display_enabled = display
+    display_interval_s = 1.0 / max(display_fps, 1.0)
+    last_display_at = 0.0
+    last_boxes: List[Tuple[int, int, int, int]] = []
+
+    if display_enabled:
+        try:
+            cv2.startWindowThread()
+        except Exception:
+            pass
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        except cv2.error as exc:
+            log.warning("display disabled: failed to open window: %s", exc)
+            display_enabled = False
 
     try:
         while True:
@@ -695,6 +711,7 @@ def camera_loop(
                     blur_kernel=blur_kernel,
                 )
                 motion_ms = (time.monotonic() - motion_start) * 1000.0
+                last_boxes = boxes
                 motion_ms_total += motion_ms
                 if motion_ms > motion_ms_max:
                     motion_ms_max = motion_ms
@@ -718,22 +735,28 @@ def camera_loop(
                     events_written += 1
                     fps_window_events += 1
 
-                if display:
-                    preview = frame.copy()
-                    for x, y, w, h in boxes:
-                        cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    if display_width > 0 and preview.shape[1] > display_width:
-                        scale = display_width / float(preview.shape[1])
-                        display_height = max(1, int(round(preview.shape[0] * scale)))
-                        preview = cv2.resize(
-                            preview,
-                            (display_width, display_height),
-                            interpolation=cv2.INTER_AREA,
-                        )
+            if display_enabled and (time.monotonic() - last_display_at) >= display_interval_s:
+                preview = frame.copy()
+                for x, y, w, h in last_boxes:
+                    cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                if display_width > 0 and preview.shape[1] > display_width:
+                    scale = display_width / float(preview.shape[1])
+                    display_height = max(1, int(round(preview.shape[0] * scale)))
+                    preview = cv2.resize(
+                        preview,
+                        (display_width, display_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                try:
                     cv2.imshow(window_name, preview)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                    key = cv2.waitKey(1) & 0xFF
+                    last_display_at = time.monotonic()
+                    if key == ord("q"):
                         log.info("display quit requested")
                         break
+                except cv2.error as exc:
+                    log.warning("display disabled after cv2 error: %s", exc)
+                    display_enabled = False
 
             now = time.monotonic()
             if now - fps_window_start >= 1.0:
@@ -766,8 +789,11 @@ def camera_loop(
     finally:
         if reader is not None:
             reader.close()
-        if display:
-            cv2.destroyAllWindows()
+        if display_enabled:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
         writer.close()
 
 
@@ -787,6 +813,7 @@ def main() -> int:
     parser.add_argument("--blur-kernel", type=int, default=5)
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--display-width", type=int, default=960)
+    parser.add_argument("--display-fps", type=float, default=10.0)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -811,6 +838,7 @@ def main() -> int:
             blur_kernel=args.blur_kernel,
             display=args.display,
             display_width=args.display_width,
+            display_fps=args.display_fps,
         )
     except KeyboardInterrupt:
         log.info("stopping")
