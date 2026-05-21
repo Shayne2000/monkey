@@ -73,10 +73,13 @@ def camera_loop():
 
     def open_cap():
         cap = cv2.VideoCapture(build_input(rtsp_in), cv2.CAP_GSTREAMER)
+        print("cap A")
         time.sleep(1)
+        print("cap b")
         return cap
 
     cap = open_cap()
+    print("cap c")
 
     prev = None
     last = 0
