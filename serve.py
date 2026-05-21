@@ -96,10 +96,12 @@ def camera_loop():
             cap.release()
             time.sleep(1)
             cap = open_cap()
+            print(not ret or frame is None)
             continue
 
         now = time.perf_counter()
         if now - last < process_interval:
+            print("13.5")
             continue
         last = now
 
