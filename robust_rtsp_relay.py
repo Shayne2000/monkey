@@ -11,7 +11,7 @@ import argparse
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import gi
@@ -40,7 +40,7 @@ class LatestFrame:
             self._updated_at = time.monotonic()
             self._seq += 1
 
-    def get(self) -> tuple[Optional[np.ndarray], float, int]:
+    def get(self) -> Tuple[Optional[np.ndarray], float, int]:
         with self._lock:
             if self._frame is None:
                 return None, self._updated_at, self._seq
