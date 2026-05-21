@@ -65,6 +65,7 @@ def camera_loop(
     cap: Optional[cv2.VideoCapture] = None
     fail_count = 0
     backoff_s = 0.5
+    frames_read = 0
 
     while not stop_event.is_set():
         if cap is None or not cap.isOpened():
@@ -96,6 +97,9 @@ def camera_loop(
             continue
 
         fail_count = 0
+        frames_read += 1
+        if frames_read == 1 or frames_read % 100 == 0:
+            log.info("input frames read=%d shape=%s", frames_read, frame.shape)
         raw_frame.put(frame)
 
     if cap is not None:
@@ -111,6 +115,8 @@ class RelayFactory(GstRtspServer.RTSPMediaFactory):
         self.height = height
         self.fps = fps
         self.frame_id = 0
+        self.push_count = 0
+        self.empty_count = 0
         self.last_output = np.zeros((height, width, 3), dtype=np.uint8)
         self.set_shared(True)
         self.set_launch(
@@ -133,6 +139,10 @@ class RelayFactory(GstRtspServer.RTSPMediaFactory):
         frame, _, _ = self.latest_frame.get()
         if frame is not None:
             self.last_output = cv2.resize(frame, (self.width, self.height))
+        else:
+            self.empty_count += 1
+            if self.empty_count == 1 or self.empty_count % self.fps == 0:
+                log.warning("output requested data but no input frame is available yet")
 
         out = np.ascontiguousarray(self.last_output)
         buf = Gst.Buffer.new_allocate(None, out.nbytes, None)
@@ -143,6 +153,9 @@ class RelayFactory(GstRtspServer.RTSPMediaFactory):
         self.frame_id += 1
 
         ret = src.emit("push-buffer", buf)
+        self.push_count += 1
+        if self.push_count == 1 or self.push_count % (self.fps * 5) == 0:
+            log.info("output frames pushed=%d flow=%s", self.push_count, ret)
         if ret != Gst.FlowReturn.OK:
             log.warning("push-buffer returned %s", ret)
 
