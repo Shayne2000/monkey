@@ -91,6 +91,7 @@ def camera_loop():
         ret, frame = cap.read()
         if not ret:
             time.sleep(1)
+            print("THIS")
             cap = cv2.VideoCapture(build_input(rtsp_in), cv2.CAP_GSTREAMER)
             continue
         
