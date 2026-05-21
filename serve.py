@@ -162,8 +162,11 @@ class Factory(GstRtspServer.RTSPMediaFactory):
 
         with frame_lock:
             if latest_frame is None:
+                print("latest_frame is None")
                 return
             frame = latest_frame.copy()
+
+        print("check point1")
 
         frame = cv2.resize(frame, (W, H))
         frame = np.ascontiguousarray(frame)
@@ -178,6 +181,8 @@ class Factory(GstRtspServer.RTSPMediaFactory):
         self.frame_id += 1
 
         src.emit("push-buffer", buf)
+
+        print("check point2")
 
 # =============================
 # MAIN
