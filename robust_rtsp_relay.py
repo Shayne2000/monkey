@@ -49,74 +49,57 @@ class GstFrameReader:
         self._lock = threading.Condition()
         self._frame = None
         self._seq = 0
+        self._last_frame_at = 0.0
 
     def start(self) -> bool:
+        attempts = []
         if gst_element_exists("nvstreammux"):
             for source in self._source_candidates():
                 for converter in self._deepstream_converter_candidates():
-                    try:
-                        self._build_deepstream_pipeline(source, converter)
-                        ret = self.pipeline.set_state(Gst.State.PLAYING)
-                        if ret == Gst.StateChangeReturn.FAILURE:
-                            raise RuntimeError("set_state(PLAYING) failed")
-                        self._start_loop()
-                        log.info(
-                            "input RTSP connected via DeepStream-style %s + nvstreammux + %s",
-                            source,
-                            converter,
-                        )
-                        return True
-                    except Exception as exc:
-                        log.warning(
-                            "DeepStream-style input open failed via %s + %s: %r",
-                            source,
-                            converter,
-                            exc,
-                        )
-                        self.close()
+                    attempts.append((
+                        f"DeepStream-style {source} + nvstreammux + {converter}",
+                        lambda s=source, c=converter: self._build_deepstream_pipeline(s, c),
+                    ))
 
         for decoder in self._h264_decoder_candidates():
             for converter in self._converter_candidates():
-                try:
-                    self._build_h264_pipeline(decoder, converter)
-                    ret = self.pipeline.set_state(Gst.State.PLAYING)
-                    if ret == Gst.StateChangeReturn.FAILURE:
-                        raise RuntimeError("set_state(PLAYING) failed")
-                    self._start_loop()
-                    log.info(
-                        "input RTSP connected via explicit H264 + %s + %s",
-                        decoder,
-                        converter,
-                    )
-                    return True
-                except Exception as exc:
-                    log.warning(
-                        "GStreamer explicit H264 open failed via %s + %s: %r",
-                        decoder,
-                        converter,
-                        exc,
-                    )
-                    self.close()
+                attempts.append((
+                    f"explicit H264 + {decoder} + {converter}",
+                    lambda d=decoder, c=converter: self._build_h264_pipeline(d, c),
+                ))
 
         for source in self._source_candidates():
             for converter in self._converter_candidates():
-                try:
-                    self._build(source, converter)
-                    ret = self.pipeline.set_state(Gst.State.PLAYING)
-                    if ret == Gst.StateChangeReturn.FAILURE:
-                        raise RuntimeError("set_state(PLAYING) failed")
-                    self._start_loop()
-                    log.info("input RTSP connected via %s + %s", source, converter)
-                    return True
-                except Exception as exc:
-                    log.warning(
-                        "GStreamer input open failed via %s + %s: %r",
-                        source,
-                        converter,
-                        exc,
-                    )
-                    self.close()
+                attempts.append((
+                    f"dynamic {source} + {converter}",
+                    lambda s=source, c=converter: self._build(s, c),
+                ))
+
+        for label, builder in attempts:
+            try:
+                builder()
+                ret = self.pipeline.set_state(Gst.State.PLAYING)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("set_state(PLAYING) failed")
+                self._start_loop()
+                if not self.wait_for_first_frame(timeout_s=8.0):
+                    raise RuntimeError("pipeline reached PLAYING but produced no frames")
+                log.info("input RTSP connected via %s", label)
+                return True
+            except Exception as exc:
+                log.warning("GStreamer input open failed via %s: %r", label, exc)
+                self.close()
         return False
+
+    def wait_for_first_frame(self, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        with self._lock:
+            while self._seq == 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._lock.wait(remaining)
+            return True
 
     def read(self, timeout_s: float = 1.0):
         deadline = time.monotonic() + timeout_s
@@ -373,10 +356,15 @@ class GstFrameReader:
         log.info("input pipeline built with %s + %s", source, converter)
 
     def _source_child_added(self, child_proxy, obj, name, user_data=None):
+        try:
+            obj.connect("child-added", self._source_child_added)
+        except Exception:
+            pass
         if "source" in name.lower() or "rtspsrc" in name.lower():
             try:
                 obj.set_property("latency", self.latency_ms)
                 obj.set_property("drop-on-latency", True)
+                obj.set_property("protocols", "tcp")
             except Exception:
                 pass
 
@@ -426,6 +414,7 @@ class GstFrameReader:
             with self._lock:
                 self._frame = frame
                 self._seq += 1
+                self._last_frame_at = time.monotonic()
                 self._lock.notify_all()
         finally:
             buf.unmap(map_info)
