@@ -3,6 +3,7 @@ import time
 import math
 import threading
 import gi
+import numpy as np
 
 gi.require_version('Gst', '1.0')
 gi.require_version('GstRtspServer', '1.0')
@@ -134,21 +135,20 @@ class Factory(GstRtspServer.RTSPMediaFactory):
         self.set_shared(True)
 
         self.launch = (
-            "appsrc name=source is-live=true block=true format=GST_FORMAT_TIME "
+            "appsrc name=source is-live=true block=true format=time "
             f"caps=video/x-raw,format=BGR,width={W},height={H},framerate={FPS}/1 ! "
-            
+
             "videoconvert ! "
             "video/x-raw,format=NV12 ! "
-            
+
             "nvvidconv ! "
             "video/x-raw(memory:NVMM),format=NV12 ! "
-            
-            "nvv4l2h264enc bitrate=2000000 insert-sps-pps=true ! "
+
+            "nvv4l2h264enc bitrate=2000000 insert-sps-pps=true maxperf-enable=1 ! "
             "h264parse ! "
             "rtph264pay config-interval=1 pt=96 name=pay0"
         )
 
-        self.frame_duration = int(1e9 / FPS)
         self.frame_id = 0
 
     def do_create_element(self, url):
@@ -167,18 +167,16 @@ class Factory(GstRtspServer.RTSPMediaFactory):
             frame = latest_frame.copy()
 
         frame = cv2.resize(frame, (W, H))
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2BGR)  # กัน weird format
+        frame = np.ascontiguousarray(frame)
 
-        data = frame.tobytes()
-
-        buf = Gst.Buffer.new_allocate(None, len(data), None)
-        buf.fill(0, data)
+        buf = Gst.Buffer.new_allocate(None, frame.nbytes, None)
+        buf.fill(0, frame.tobytes())
 
         duration = Gst.SECOND // FPS
-        buf.duration = duration
 
-        pts = self.frame_id * duration
-        buf.pts = buf.dts = pts
+        buf.duration = duration
+        buf.pts = buf.dts = self.frame_id * duration
+        buf.offset = self.frame_id
 
         self.frame_id += 1
 
