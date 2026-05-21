@@ -31,10 +31,14 @@ frame_lock = threading.Lock()
 # =============================
 def build_input(url):
     return (
-        "rtspsrc location=" + url + " protocols=tcp latency=1000 drop-on-latency=true ! "
-        "rtph264depay ! h264parse ! avdec_h264 ! "
-        "videoconvert ! video/x-raw,format=BGR ! "
-        "appsink drop=1 sync=false max-buffers=1"
+        "rtspsrc location=" + url +
+        " protocols=tcp latency=300 drop-on-latency=true ! "
+        "rtph264depay ! h264parse ! "
+        "nvv4l2decoder ! nvvidconv ! "
+        "video/x-raw,format=BGRx ! videoconvert ! "
+        "video/x-raw,format=BGR ! "
+        "queue max-size-buffers=1 leaky=downstream ! "
+        "appsink sync=false drop=true max-buffers=1"
     )
 
 # =============================
@@ -72,36 +76,56 @@ def camera_loop():
     global latest_frame
 
     def open_cap():
+        print("[INFO] opening RTSP...")
         cap = cv2.VideoCapture(build_input(rtsp_in), cv2.CAP_GSTREAMER)
-        print("cap A")
-        time.sleep(1)
-        print("cap b")
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
     cap = open_cap()
-    print("cap c")
 
     prev = None
-    last = 0
-    merged = []
+    last = time.perf_counter()
 
-    print("[INFO] Camera started")
+    fail_count = 0
+
+    print("[INFO] Camera started (robust mode)")
 
     while True:
 
         ret, frame = cap.read()
 
+        if frame is None:
+            print("frame is None")
+
+        if not ret:
+            print("ret = False")
+
+        # =========================
+        # ❌ FRAME FAIL → ไม่ reconnect ทันที
+        # =========================
         if not ret or frame is None:
-            print("[WARN] reconnect RTSP")
-            cap.release()
-            time.sleep(1000)
-            cap = open_cap()
-            print(not ret or frame is None)
+            fail_count += 1
+            print(f"[WARN] frame drop ({fail_count})")
+
+            time.sleep(0.05)
+
+            # reconnect เฉพาะ fail หนัก ๆ
+            if fail_count > 30:
+                print("[WARN] reconnect RTSP")
+                cap.release()
+                time.sleep(1)
+                cap = open_cap()
+                fail_count = 0
+
             continue
 
+        fail_count = 0
+
+        # =========================
+        # FPS control (soft)
+        # =========================
         now = time.perf_counter()
         if now - last < process_interval:
-            print("13.5")
             continue
         last = now
 
@@ -174,6 +198,8 @@ class Factory(GstRtspServer.RTSPMediaFactory):
                 print("latest_frame is None")
                 return
             frame = latest_frame.copy()
+            if frame is None:
+                return
 
         print("check point1")
 
