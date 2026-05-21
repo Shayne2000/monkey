@@ -93,12 +93,13 @@ def camera_loop():
             time.sleep(1)
             cap = cv2.VideoCapture(build_input(rtsp_in), cv2.CAP_GSTREAMER)
             continue
-
+        
+        print("pass1")
         now = time.perf_counter()
         if now - last < process_interval:
             continue
         last = now
-
+        print("pass2")
         frame = cv2.resize(frame, (W, H))
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -119,7 +120,7 @@ def camera_loop():
                 boxes.append((x, y, w, h))
 
             merged = adaptive_merge(boxes)
-
+        print("pass3")
         prev = gray
 
         for x, y, w, h in merged:
