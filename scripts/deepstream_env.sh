@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -e
+
+export DEEPSTREAM_DIR="${DEEPSTREAM_DIR:-/opt/nvidia/deepstream/deepstream-5.1}"
+export GST_PLUGIN_PATH="$DEEPSTREAM_DIR/lib/gst-plugins:${GST_PLUGIN_PATH:-}"
+export LD_LIBRARY_PATH="$DEEPSTREAM_DIR/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="$DEEPSTREAM_DIR/lib:${PYTHONPATH:-}"
+
+echo "DEEPSTREAM_DIR=$DEEPSTREAM_DIR"
+echo "GST_PLUGIN_PATH=$GST_PLUGIN_PATH"
+echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+echo "PYTHONPATH=$PYTHONPATH"

@@ -76,12 +76,44 @@ Disable model inference and log motion only:
 python3 robust_rtsp_relay.py --no-models
 ```
 
+## DeepStream YOLO Path
+
+Use this path on Jetson when OpenCV DNN and ONNX Runtime are not available, but
+DeepStream 5.1 plugins and `pyds` are available.
+
+Set the DeepStream environment:
+
+```bash
+source scripts/deepstream_env.sh
+```
+
+Build the YOLO parser once on the Jetson:
+
+```bash
+make -C deepstream
+```
+
+Run primary YOLO detection for one camera:
+
+```bash
+/usr/bin/python3 deepstream_vehicle_log.py --single-camera --input rtsp://10.0.11.153:8554/cctv02 --camera-id cctv02
+```
+
+Run the default 5 cameras:
+
+```bash
+/usr/bin/python3 deepstream_vehicle_log.py
+```
+
+This DeepStream runner writes the same `vehicle_log.jsonl` shape. It currently
+logs `vehicle_type`, bbox, confidence, and default `color=black`. Brand/color
+secondary classifiers can be added after primary detection is stable.
+
 ## Important
 
 DeepStream plugins such as `nvstreammux`, `nvurisrcbin`, and `nvinfer` are NVIDIA system plugins. They do not come from pip or a copied `.venv`.
 
 Use `scripts/check_jetson_env.sh` to see what is missing.
 
-Current model inference uses OpenCV DNN (`cv2.dnn.readNetFromONNX`) after the
-motion gate. DeepStream `nvinfer` remains a later integration path if the Jetson
-runtime has the required plugins.
+`robust_rtsp_relay.py` keeps the motion-gated OpenCV/ONNX Runtime path.
+`deepstream_vehicle_log.py` is the Jetson-native DeepStream `nvinfer` path.
