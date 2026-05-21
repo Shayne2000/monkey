@@ -51,6 +51,53 @@ class GstFrameReader:
         self._seq = 0
 
     def start(self) -> bool:
+        if gst_element_exists("nvstreammux"):
+            for source in self._source_candidates():
+                for converter in self._deepstream_converter_candidates():
+                    try:
+                        self._build_deepstream_pipeline(source, converter)
+                        ret = self.pipeline.set_state(Gst.State.PLAYING)
+                        if ret == Gst.StateChangeReturn.FAILURE:
+                            raise RuntimeError("set_state(PLAYING) failed")
+                        self._start_loop()
+                        log.info(
+                            "input RTSP connected via DeepStream-style %s + nvstreammux + %s",
+                            source,
+                            converter,
+                        )
+                        return True
+                    except Exception as exc:
+                        log.warning(
+                            "DeepStream-style input open failed via %s + %s: %r",
+                            source,
+                            converter,
+                            exc,
+                        )
+                        self.close()
+
+        for decoder in self._h264_decoder_candidates():
+            for converter in self._converter_candidates():
+                try:
+                    self._build_h264_pipeline(decoder, converter)
+                    ret = self.pipeline.set_state(Gst.State.PLAYING)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        raise RuntimeError("set_state(PLAYING) failed")
+                    self._start_loop()
+                    log.info(
+                        "input RTSP connected via explicit H264 + %s + %s",
+                        decoder,
+                        converter,
+                    )
+                    return True
+                except Exception as exc:
+                    log.warning(
+                        "GStreamer explicit H264 open failed via %s + %s: %r",
+                        decoder,
+                        converter,
+                        exc,
+                    )
+                    self.close()
+
         for source in self._source_candidates():
             for converter in self._converter_candidates():
                 try:
@@ -121,6 +168,21 @@ class GstFrameReader:
         candidates.append("uridecodebin")
         return candidates
 
+    def _h264_decoder_candidates(self) -> List[str]:
+        candidates = []
+        for decoder in ("nvv4l2decoder", "omxh264dec", "avdec_h264"):
+            if gst_element_exists(decoder):
+                candidates.append(decoder)
+        return candidates
+
+    def _deepstream_converter_candidates(self) -> List[str]:
+        candidates = []
+        if gst_element_exists("nvvideoconvert"):
+            candidates.append("nvvideoconvert")
+        if gst_element_exists("nvvidconv"):
+            candidates.append("nvvidconv")
+        return candidates
+
     def _converter_candidates(self) -> List[str]:
         candidates = []
         if gst_element_exists("nvvideoconvert"):
@@ -129,6 +191,135 @@ class GstFrameReader:
             candidates.append("nvvidconv")
         candidates.append("videoconvert")
         return candidates
+
+    def _request_mux_sink_pad(self, mux, index: int):
+        sinkpad = mux.get_request_pad(f"sink_{index}")
+        if sinkpad:
+            return sinkpad
+        return mux.get_request_pad("sink_%u")
+
+    def _build_deepstream_pipeline(self, source: str, converter: str) -> None:
+        self.pipeline = Gst.Pipeline.new("motion-deepstream-input-pipeline")
+        if self.pipeline is None:
+            raise RuntimeError("failed to create pipeline")
+
+        streammux = Gst.ElementFactory.make("nvstreammux", "stream-muxer")
+        conv1 = Gst.ElementFactory.make(converter, "post-mux-converter")
+        caps_bgrx = Gst.ElementFactory.make("capsfilter", "caps-bgrx")
+        conv2 = Gst.ElementFactory.make("videoconvert", "bgr-converter")
+        caps_bgr = Gst.ElementFactory.make("capsfilter", "caps-bgr")
+        sink = Gst.ElementFactory.make("appsink", "framesink")
+        elements = [streammux, conv1, caps_bgrx, conv2, caps_bgr, sink]
+        if any(el is None for el in elements):
+            raise RuntimeError(f"failed to create DeepStream chain with converter={converter}")
+
+        source_bin = self._create_source_bin(source)
+        if source_bin is None:
+            raise RuntimeError("failed to create source bin")
+
+        streammux.set_property("width", 640)
+        streammux.set_property("height", 360)
+        streammux.set_property("batch-size", 1)
+        streammux.set_property("batched-push-timeout", 40000)
+        streammux.set_property("live-source", 1)
+        caps_bgrx.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGRx"))
+        caps_bgr.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGR"))
+        sink.set_property("emit-signals", True)
+        sink.set_property("sync", False)
+        sink.set_property("max-buffers", 1)
+        sink.set_property("drop", True)
+        sink.connect("new-sample", self._on_sample)
+
+        self.pipeline.add(source_bin)
+        for el in elements:
+            self.pipeline.add(el)
+
+        mux_sink = self._request_mux_sink_pad(streammux, 0)
+        source_src = source_bin.get_static_pad("src")
+        if not mux_sink or not source_src:
+            raise RuntimeError("failed to get source/mux pads")
+        ret = source_src.link(mux_sink)
+        if ret != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"failed to link source-bin -> nvstreammux: {ret}")
+
+        chain = [streammux, conv1, caps_bgrx, conv2, caps_bgr, sink]
+        for a, b in zip(chain[:-1], chain[1:]):
+            if not a.link(b):
+                raise RuntimeError(f"failed to link {a.get_name()} -> {b.get_name()}")
+
+        self.appsink = sink
+        log.info("DeepStream-style input pipeline built with %s + nvstreammux + %s", source, converter)
+
+    def _create_source_bin(self, source: str):
+        source_bin = Gst.Bin.new("source-bin-0")
+        if source_bin is None:
+            return None
+
+        src = Gst.ElementFactory.make(source, "input-source")
+        if src is None:
+            return None
+        src.set_property("uri", self.uri)
+        if source == "nvurisrcbin":
+            try:
+                src.set_property("drop-on-latency", True)
+                src.set_property("latency", self.latency_ms)
+            except Exception:
+                pass
+        try:
+            src.connect("child-added", self._source_child_added)
+        except TypeError:
+            pass
+        src.connect("pad-added", self._source_bin_pad_added, source_bin)
+
+        source_bin.add(src)
+        ghost_pad = Gst.GhostPad.new_no_target("src", Gst.PadDirection.SRC)
+        if ghost_pad is None:
+            return None
+        source_bin.add_pad(ghost_pad)
+        return source_bin
+
+    def _source_bin_pad_added(self, decodebin, pad, source_bin):
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        if not caps or caps.get_size() == 0:
+            log.warning("source-bin pad-added without caps")
+            return
+
+        structure_name = caps.get_structure(0).get_name()
+        log.info("source-bin pad-added caps=%s", caps.to_string())
+        if not structure_name.startswith("video"):
+            return
+
+        features = caps.get_features(0)
+        if not features or not features.contains("memory:NVMM"):
+            log.warning("source-bin video pad is not NVMM; caps=%s", caps.to_string())
+            return
+
+        ghost_pad = source_bin.get_static_pad("src")
+        if ghost_pad.set_target(pad):
+            log.info("linked source-bin NVIDIA/NVMM video pad")
+        else:
+            log.warning("failed to target source-bin ghost pad")
+
+    def _build_h264_pipeline(self, decoder: str, converter: str) -> None:
+        pipeline_desc = (
+            f'rtspsrc location="{self.uri}" protocols=tcp latency={self.latency_ms} '
+            "drop-on-latency=true "
+            "! rtph264depay "
+            "! h264parse config-interval=-1 "
+            "! queue max-size-buffers=1 leaky=downstream "
+            f"! {decoder} "
+            f"! {converter} "
+            "! video/x-raw,format=BGRx "
+            "! videoconvert "
+            "! video/x-raw,format=BGR "
+            "! appsink name=framesink emit-signals=true sync=false max-buffers=1 drop=true"
+        )
+        log.info("input explicit H264 pipeline: %s", pipeline_desc)
+        self.pipeline = Gst.parse_launch(pipeline_desc)
+        self.appsink = self.pipeline.get_by_name("framesink")
+        if self.appsink is None:
+            raise RuntimeError("appsink not found")
+        self.appsink.connect("new-sample", self._on_sample)
 
     def _build(self, source: str, converter: str) -> None:
         self.pipeline = Gst.Pipeline.new("motion-input-pipeline")
