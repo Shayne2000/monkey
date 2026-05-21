@@ -47,14 +47,20 @@ class LatestFrame:
             return self._frame.copy(), self._updated_at, self._seq
 
 
-def build_input_pipeline(url: str, width: int, height: int, latency_ms: int) -> str:
+def build_input_pipeline(
+    url: str,
+    width: int,
+    height: int,
+    latency_ms: int,
+    decoder: str,
+) -> str:
     return (
         f"rtspsrc location={url} protocols=tcp latency={latency_ms} "
         "drop-on-latency=true ! "
         "rtph264depay ! "
         "h264parse config-interval=-1 ! "
         "queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream ! "
-        "nvv4l2decoder ! "
+        f"{decoder} ! "
         "nvvidconv ! "
         f"video/x-raw,format=BGRx,width={width},height={height} ! "
         "videoconvert ! "
@@ -63,10 +69,16 @@ def build_input_pipeline(url: str, width: int, height: int, latency_ms: int) -> 
     )
 
 
-def open_capture(url: str, width: int, height: int, latency_ms: int) -> cv2.VideoCapture:
-    pipeline = build_input_pipeline(url, width, height, latency_ms)
-    log.info("opening input RTSP with GStreamer")
-    log.debug("pipeline: %s", pipeline)
+def open_capture(
+    url: str,
+    width: int,
+    height: int,
+    latency_ms: int,
+    decoder: str,
+) -> cv2.VideoCapture:
+    pipeline = build_input_pipeline(url, width, height, latency_ms, decoder)
+    log.info("opening input RTSP with GStreamer decoder=%s", decoder)
+    log.info("input pipeline: %s", pipeline)
     return cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 
 
@@ -77,6 +89,7 @@ def camera_loop(
     width: int,
     height: int,
     latency_ms: int,
+    decoders: Tuple[str, ...],
     stop_event: threading.Event,
 ) -> None:
     cap: Optional[cv2.VideoCapture] = None
@@ -85,11 +98,15 @@ def camera_loop(
 
     while not stop_event.is_set():
         if cap is None or not cap.isOpened():
-            cap = open_capture(rtsp_url, width, height, latency_ms)
-            if not cap.isOpened():
-                log.warning("input open failed; retrying in %.1fs", backoff_s)
+            for decoder in decoders:
+                cap = open_capture(rtsp_url, width, height, latency_ms, decoder)
+                if cap.isOpened():
+                    break
+                log.warning("input open failed with decoder=%s", decoder)
                 cap.release()
                 cap = None
+            if cap is None or not cap.isOpened():
+                log.warning("all input decoders failed; retrying in %.1fs", backoff_s)
                 stop_event.wait(backoff_s)
                 backoff_s = min(backoff_s * 2, 5.0)
                 continue
@@ -172,6 +189,8 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=270)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--latency-ms", type=int, default=100)
+    parser.add_argument("--decoder", default="nvv4l2decoder")
+    parser.add_argument("--fallback-decoder", default="omxh264dec")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -192,6 +211,7 @@ def main() -> int:
             "width": args.width,
             "height": args.height,
             "latency_ms": args.latency_ms,
+            "decoders": tuple(d for d in (args.decoder, args.fallback_decoder) if d),
             "stop_event": stop_event,
         },
         name="camera_loop",
