@@ -39,9 +39,11 @@ def gst_element_exists(factory_name: str) -> bool:
 class GstFrameReader:
     """Latest-frame reader based on the DeepStream sample's GStreamer source path."""
 
-    def __init__(self, uri: str, latency_ms: int) -> None:
+    def __init__(self, uri: str, latency_ms: int, input_width: int, input_height: int) -> None:
         self.uri = uri
         self.latency_ms = latency_ms
+        self.input_width = input_width
+        self.input_height = input_height
         self.pipeline = None
         self.appsink = None
         self.loop = None
@@ -53,6 +55,13 @@ class GstFrameReader:
 
     def start(self) -> bool:
         attempts = []
+        for decoder in self._h264_decoder_candidates():
+            for converter in self._converter_candidates():
+                attempts.append((
+                    f"explicit H264 + {decoder} + {converter}",
+                    lambda d=decoder, c=converter: self._build_h264_pipeline(d, c),
+                ))
+
         if gst_element_exists("nvstreammux"):
             for source in self._source_candidates():
                 for converter in self._deepstream_converter_candidates():
@@ -60,13 +69,6 @@ class GstFrameReader:
                         f"DeepStream-style {source} + nvstreammux + {converter}",
                         lambda s=source, c=converter: self._build_deepstream_pipeline(s, c),
                     ))
-
-        for decoder in self._h264_decoder_candidates():
-            for converter in self._converter_candidates():
-                attempts.append((
-                    f"explicit H264 + {decoder} + {converter}",
-                    lambda d=decoder, c=converter: self._build_h264_pipeline(d, c),
-                ))
 
         for source in self._source_candidates():
             for converter in self._converter_candidates():
@@ -205,7 +207,7 @@ class GstFrameReader:
         streammux.set_property("batch-size", 1)
         streammux.set_property("batched-push-timeout", 40000)
         streammux.set_property("live-source", 1)
-        caps_bgrx.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGRx"))
+        caps_bgrx.set_property("caps", Gst.Caps.from_string(self._bgrx_caps_string()))
         caps_bgr.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGR"))
         sink.set_property("emit-signals", True)
         sink.set_property("sync", False)
@@ -292,7 +294,7 @@ class GstFrameReader:
             "! queue max-size-buffers=1 leaky=downstream "
             f"! {decoder} "
             f"! {converter} "
-            "! video/x-raw,format=BGRx "
+            f"! {self._bgrx_caps_string()} "
             "! videoconvert "
             "! video/x-raw,format=BGR "
             "! appsink name=framesink emit-signals=true sync=false max-buffers=1 drop=true"
@@ -336,7 +338,7 @@ class GstFrameReader:
 
         queue.set_property("max-size-buffers", 1)
         queue.set_property("leaky", 2)
-        caps_bgrx.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGRx"))
+        caps_bgrx.set_property("caps", Gst.Caps.from_string(self._bgrx_caps_string()))
         caps_bgr.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGR"))
         sink.set_property("emit-signals", True)
         sink.set_property("sync", False)
@@ -367,6 +369,12 @@ class GstFrameReader:
                 obj.set_property("protocols", "tcp")
             except Exception:
                 pass
+
+    def _bgrx_caps_string(self) -> str:
+        caps = "video/x-raw,format=BGRx"
+        if self.input_width > 0 and self.input_height > 0:
+            caps += f",width={self.input_width},height={self.input_height}"
+        return caps
 
     def _source_pad_added(self, decodebin, pad, queue):
         caps = pad.get_current_caps() or pad.query_caps(None)
@@ -599,6 +607,8 @@ def camera_loop(
     rtsp_url: str,
     camera_id: str,
     latency_ms: int,
+    input_width: int,
+    input_height: int,
     event_log_path: str,
     process_every_n: int,
     min_area: float,
@@ -633,7 +643,7 @@ def camera_loop(
     try:
         while True:
             if reader is None:
-                reader = GstFrameReader(rtsp_url, latency_ms)
+                reader = GstFrameReader(rtsp_url, latency_ms, input_width, input_height)
                 if not reader.start():
                     log.warning("input open failed; retrying in %.1fs", backoff_s)
                     reader.close()
@@ -766,6 +776,8 @@ def main() -> int:
     parser.add_argument("--input", default="rtsp://10.0.11.153:8554/cctv02")
     parser.add_argument("--camera-id", default="cctv02")
     parser.add_argument("--latency-ms", type=int, default=200)
+    parser.add_argument("--input-width", type=int, default=640)
+    parser.add_argument("--input-height", type=int, default=360)
     parser.add_argument("--event-log", default="vehicle_log.jsonl")
     parser.add_argument("--process-every-n", type=int, default=2)
     parser.add_argument("--min-area", type=float, default=1000.0)
@@ -788,6 +800,8 @@ def main() -> int:
             rtsp_url=args.input,
             camera_id=args.camera_id,
             latency_ms=args.latency_ms,
+            input_width=args.input_width,
+            input_height=args.input_height,
             event_log_path=args.event_log,
             process_every_n=args.process_every_n,
             min_area=args.min_area,
