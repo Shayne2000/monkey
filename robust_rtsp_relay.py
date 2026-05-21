@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Robust RTSP input reader with 2-frame motion logging for Jetson Nano.
+"""Robust DeepStream-style input reader with 2-frame motion logging.
 
 Design goals:
-- Read RTSP with OpenCV FFmpeg.
+- Read RTSP with GStreamer, preferring DeepStream/NVIDIA decode elements.
 - Reconnect when the stream stalls.
 - Detect motion with 2-frame diff.
 - Write vehicle_log-shaped JSONL events for downstream ingestion.
@@ -14,22 +14,133 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import cv2
+import gi
+import numpy as np
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
 
 
 log = logging.getLogger("robust_rtsp_relay")
+Gst.init(None)
 
 
-def open_capture(url: str) -> cv2.VideoCapture:
-    log.info("opening input RTSP with OpenCV FFmpeg")
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+def gst_element_exists(factory_name: str) -> bool:
+    return Gst.ElementFactory.find(factory_name) is not None
+
+
+class GstFrameReader:
+    """Latest-frame reader based on the DeepStream sample's GStreamer source path."""
+
+    def __init__(self, uri: str, latency_ms: int) -> None:
+        self.uri = uri
+        self.latency_ms = latency_ms
+        self.pipeline = None
+        self.appsink = None
+        self._lock = threading.Condition()
+        self._frame = None
+        self._seq = 0
+
+    def start(self) -> bool:
+        for source in self._source_candidates():
+            try:
+                self._build(source)
+                ret = self.pipeline.set_state(Gst.State.PLAYING)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("set_state(PLAYING) failed")
+                log.info("input RTSP connected via %s", source)
+                return True
+            except Exception as exc:
+                log.warning("GStreamer input open failed via %s: %r", source, exc)
+                self.close()
+        return False
+
+    def read(self, timeout_s: float = 1.0):
+        deadline = time.monotonic() + timeout_s
+        with self._lock:
+            start_seq = self._seq
+            while self._seq == start_seq:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False, None
+                self._lock.wait(remaining)
+            return True, self._frame.copy()
+
+    def close(self) -> None:
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+        self.pipeline = None
+        self.appsink = None
+
+    def _source_candidates(self) -> List[str]:
+        candidates = []
+        if gst_element_exists("nvurisrcbin"):
+            candidates.append("nvurisrcbin")
+        candidates.append("uridecodebin")
+        return candidates
+
+    def _build(self, source: str) -> None:
+        if source == "nvurisrcbin":
+            source_part = (
+                f'nvurisrcbin uri="{self.uri}" drop-on-latency=true '
+                f"latency={self.latency_ms}"
+            )
+        else:
+            source_part = f'uridecodebin uri="{self.uri}"'
+
+        pipeline_desc = (
+            source_part
+            + " ! queue max-size-buffers=1 leaky=downstream "
+            + " ! nvvideoconvert "
+            + " ! video/x-raw,format=RGBA "
+            + " ! videoconvert "
+            + " ! video/x-raw,format=BGR "
+            + " ! appsink name=framesink emit-signals=true sync=false max-buffers=1 drop=true"
+        )
+        log.info("input pipeline: %s", pipeline_desc)
+        self.pipeline = Gst.parse_launch(pipeline_desc)
+        self.appsink = self.pipeline.get_by_name("framesink")
+        if self.appsink is None:
+            raise RuntimeError("appsink not found")
+        self.appsink.connect("new-sample", self._on_sample)
+
+    def _on_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        structure = caps.get_structure(0)
+        width = int(structure.get_value("width"))
+        height = int(structure.get_value("height"))
+
+        success, map_info = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.ERROR
+
+        try:
+            arr = np.frombuffer(map_info.data, dtype=np.uint8)
+            expected = height * width * 3
+            if arr.size < expected:
+                log.warning("input buffer too small: got=%d expected=%d", arr.size, expected)
+                return Gst.FlowReturn.OK
+            frame = arr[:expected].reshape((height, width, 3)).copy()
+            with self._lock:
+                self._frame = frame
+                self._seq += 1
+                self._lock.notify_all()
+        finally:
+            buf.unmap(map_info)
+
+        return Gst.FlowReturn.OK
 
 
 def utc_now_iso() -> str:
@@ -208,6 +319,7 @@ def camera_loop(
     *,
     rtsp_url: str,
     camera_id: str,
+    latency_ms: int,
     event_log_path: str,
     process_every_n: int,
     min_area: float,
@@ -218,7 +330,7 @@ def camera_loop(
     display: bool,
     display_width: int,
 ) -> None:
-    cap: Optional[cv2.VideoCapture] = None
+    reader: Optional[GstFrameReader] = None
     fail_count = 0
     backoff_s = 0.5
     frames_read = 0
@@ -241,22 +353,21 @@ def camera_loop(
 
     try:
         while True:
-            if cap is None or not cap.isOpened():
-                cap = open_capture(rtsp_url)
-                if cap is None or not cap.isOpened():
+            if reader is None:
+                reader = GstFrameReader(rtsp_url, latency_ms)
+                if not reader.start():
                     log.warning("input open failed; retrying in %.1fs", backoff_s)
-                    if cap is not None:
-                        cap.release()
-                        cap = None
+                    reader.close()
+                    reader = None
                     time.sleep(backoff_s)
                     backoff_s = min(backoff_s * 2, 5.0)
                     continue
-                log.info("input RTSP connected camera_id=%s", camera_id)
+                log.info("input reader ready camera_id=%s", camera_id)
                 fail_count = 0
                 backoff_s = 0.5
 
             read_start = time.monotonic()
-            ok, frame = cap.read()
+            ok, frame = reader.read(timeout_s=1.0)
             read_ms = (time.monotonic() - read_start) * 1000.0
             if not ok or frame is None:
                 fail_count += 1
@@ -264,8 +375,8 @@ def camera_loop(
                     log.warning("input frame read failed count=%d", fail_count)
                 if fail_count >= 30:
                     log.warning("too many input failures; reconnecting")
-                    cap.release()
-                    cap = None
+                    reader.close()
+                    reader = None
                     fail_count = 0
                 else:
                     time.sleep(0.03)
@@ -364,8 +475,8 @@ def camera_loop(
                 write_ms_total = 0.0
                 write_ms_max = 0.0
     finally:
-        if cap is not None:
-            cap.release()
+        if reader is not None:
+            reader.close()
         if display:
             cv2.destroyAllWindows()
         writer.close()
@@ -375,6 +486,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="rtsp://10.0.11.153:8554/cctv02")
     parser.add_argument("--camera-id", default="cctv02")
+    parser.add_argument("--latency-ms", type=int, default=200)
     parser.add_argument("--event-log", default="vehicle_log.jsonl")
     parser.add_argument("--process-every-n", type=int, default=2)
     parser.add_argument("--min-area", type=float, default=1000.0)
@@ -396,6 +508,7 @@ def main() -> int:
         camera_loop(
             rtsp_url=args.input,
             camera_id=args.camera_id,
+            latency_ms=args.latency_ms,
             event_log_path=args.event_log,
             process_every_n=args.process_every_n,
             min_area=args.min_area,
