@@ -570,6 +570,11 @@ class VehicleModelPipeline:
     def maybe_create(cls, args):
         if not args.enable_models:
             return None
+        if not hasattr(cv2, "dnn") or not hasattr(cv2.dnn, "readNetFromONNX"):
+            raise RuntimeError(
+                "this OpenCV build does not support cv2.dnn.readNetFromONNX; "
+                "run with --no-models for motion-only mode, or install an OpenCV build with DNN/ONNX support"
+            )
         missing = [
             path for path in (args.yolo_model, args.classifier_model, args.labels)
             if not os.path.exists(path)
@@ -818,7 +823,7 @@ def build_vehicle_log_event(
         "camera_id": camera_id,
         "last_seen": detected_at,
         "vehicle_type": vehicle_type,
-        "color": None,
+        "color": "black",
         "brand": brand,
         "plate": None,
         "position_x": float(x + w / 2.0),
@@ -827,7 +832,7 @@ def build_vehicle_log_event(
         "bbox_height": float(h),
         "event_type": event_type,
         "type_confidence": type_confidence,
-        "color_confidence": None,
+        "color_confidence": 0.0,
         "brand_confidence": brand_confidence,
     }
 

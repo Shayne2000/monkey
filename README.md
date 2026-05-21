@@ -35,6 +35,16 @@ Check model loading:
 python3 scripts/check_models.py
 ```
 
+If Jetson OpenCV is old and prints `module 'cv2' has no attribute 'dnn'`,
+run motion logging first with:
+
+```bash
+python3 robust_rtsp_relay.py --no-models
+```
+
+The model path needs OpenCV DNN/ONNX support or a later DeepStream `nvinfer`
+integration.
+
 Run all 5 default cameras:
 
 ```bash

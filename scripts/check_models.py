@@ -16,6 +16,11 @@ def load_labels(path):
 
 
 def run_forward(model_path, size):
+    if not hasattr(cv2, "dnn") or not hasattr(cv2.dnn, "readNetFromONNX"):
+        raise RuntimeError(
+            "this OpenCV build has no cv2.dnn.readNetFromONNX; "
+            "use robust_rtsp_relay.py --no-models or install OpenCV with DNN/ONNX support"
+        )
     net = cv2.dnn.readNetFromONNX(model_path)
     image = np.zeros((size, size, 3), dtype=np.uint8)
     blob = cv2.dnn.blobFromImage(
