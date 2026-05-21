@@ -102,29 +102,82 @@ class GstFrameReader:
         return candidates
 
     def _build(self, source: str, converter: str) -> None:
-        if source == "nvurisrcbin":
-            source_part = (
-                f'nvurisrcbin uri="{self.uri}" drop-on-latency=true '
-                f"latency={self.latency_ms}"
-            )
-        else:
-            source_part = f'uridecodebin uri="{self.uri}"'
+        self.pipeline = Gst.Pipeline.new("motion-input-pipeline")
+        if self.pipeline is None:
+            raise RuntimeError("failed to create pipeline")
 
-        pipeline_desc = (
-            source_part
-            + " ! queue max-size-buffers=1 leaky=downstream "
-            + f" ! {converter} "
-            + " ! video/x-raw,format=BGRx "
-            + " ! videoconvert "
-            + " ! video/x-raw,format=BGR "
-            + " ! appsink name=framesink emit-signals=true sync=false max-buffers=1 drop=true"
-        )
-        log.info("input pipeline: %s", pipeline_desc)
-        self.pipeline = Gst.parse_launch(pipeline_desc)
-        self.appsink = self.pipeline.get_by_name("framesink")
-        if self.appsink is None:
-            raise RuntimeError("appsink not found")
-        self.appsink.connect("new-sample", self._on_sample)
+        src = Gst.ElementFactory.make(source, "input-source")
+        queue = Gst.ElementFactory.make("queue", "input-queue")
+        conv1 = Gst.ElementFactory.make(converter, "input-converter")
+        caps_bgrx = Gst.ElementFactory.make("capsfilter", "caps-bgrx")
+        conv2 = Gst.ElementFactory.make("videoconvert", "bgr-converter")
+        caps_bgr = Gst.ElementFactory.make("capsfilter", "caps-bgr")
+        sink = Gst.ElementFactory.make("appsink", "framesink")
+
+        elements = [src, queue, conv1, caps_bgrx, conv2, caps_bgr, sink]
+        if any(el is None for el in elements):
+            raise RuntimeError(f"failed to create one or more elements with converter={converter}")
+
+        src.set_property("uri", self.uri)
+        if source == "nvurisrcbin":
+            try:
+                src.set_property("drop-on-latency", True)
+                src.set_property("latency", self.latency_ms)
+            except Exception:
+                pass
+        try:
+            src.connect("child-added", self._source_child_added)
+        except TypeError:
+            pass
+        src.connect("pad-added", self._source_pad_added, queue)
+
+        queue.set_property("max-size-buffers", 1)
+        queue.set_property("leaky", 2)
+        caps_bgrx.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGRx"))
+        caps_bgr.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGR"))
+        sink.set_property("emit-signals", True)
+        sink.set_property("sync", False)
+        sink.set_property("max-buffers", 1)
+        sink.set_property("drop", True)
+        sink.connect("new-sample", self._on_sample)
+
+        for el in elements:
+            self.pipeline.add(el)
+
+        chain = [queue, conv1, caps_bgrx, conv2, caps_bgr, sink]
+        for a, b in zip(chain[:-1], chain[1:]):
+            if not a.link(b):
+                raise RuntimeError(f"failed to link {a.get_name()} -> {b.get_name()}")
+
+        self.appsink = sink
+        log.info("input pipeline built with %s + %s", source, converter)
+
+    def _source_child_added(self, child_proxy, obj, name, user_data=None):
+        if "source" in name.lower() or "rtspsrc" in name.lower():
+            try:
+                obj.set_property("latency", self.latency_ms)
+                obj.set_property("drop-on-latency", True)
+            except Exception:
+                pass
+
+    def _source_pad_added(self, decodebin, pad, queue):
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        if not caps or caps.get_size() == 0:
+            return
+
+        structure_name = caps.get_structure(0).get_name()
+        if not structure_name.startswith("video"):
+            return
+
+        sinkpad = queue.get_static_pad("sink")
+        if sinkpad.is_linked():
+            return
+
+        ret = pad.link(sinkpad)
+        if ret == Gst.PadLinkReturn.OK:
+            log.info("linked input video pad caps=%s", caps.to_string())
+        else:
+            log.warning("failed to link input video pad: %s caps=%s", ret, caps.to_string())
 
     def _on_sample(self, sink):
         sample = sink.emit("pull-sample")
