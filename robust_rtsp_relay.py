@@ -25,7 +25,7 @@ import gi
 import numpy as np
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst
+from gi.repository import GLib, Gst
 
 
 log = logging.getLogger("robust_rtsp_relay")
@@ -44,6 +44,8 @@ class GstFrameReader:
         self.latency_ms = latency_ms
         self.pipeline = None
         self.appsink = None
+        self.loop = None
+        self.loop_thread = None
         self._lock = threading.Condition()
         self._frame = None
         self._seq = 0
@@ -56,6 +58,7 @@ class GstFrameReader:
                     ret = self.pipeline.set_state(Gst.State.PLAYING)
                     if ret == Gst.StateChangeReturn.FAILURE:
                         raise RuntimeError("set_state(PLAYING) failed")
+                    self._start_loop()
                     log.info("input RTSP connected via %s + %s", source, converter)
                     return True
                 except Exception as exc:
@@ -82,8 +85,34 @@ class GstFrameReader:
     def close(self) -> None:
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
+        if self.loop is not None:
+            self.loop.quit()
+        if self.loop_thread is not None:
+            self.loop_thread.join(timeout=1.0)
         self.pipeline = None
         self.appsink = None
+        self.loop = None
+        self.loop_thread = None
+
+    def _start_loop(self) -> None:
+        self.loop = GLib.MainLoop()
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+        self.loop_thread = threading.Thread(target=self.loop.run, daemon=True)
+        self.loop_thread.start()
+
+    def _on_bus_message(self, bus, message):
+        msg_type = message.type
+        if msg_type == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            log.warning("GStreamer bus error: %s debug=%s", err, debug)
+        elif msg_type == Gst.MessageType.WARNING:
+            err, debug = message.parse_warning()
+            log.warning("GStreamer bus warning: %s debug=%s", err, debug)
+        elif msg_type == Gst.MessageType.EOS:
+            log.warning("GStreamer bus EOS")
+        return True
 
     def _source_candidates(self) -> List[str]:
         candidates = []
@@ -163,9 +192,11 @@ class GstFrameReader:
     def _source_pad_added(self, decodebin, pad, queue):
         caps = pad.get_current_caps() or pad.query_caps(None)
         if not caps or caps.get_size() == 0:
+            log.warning("input pad-added without caps")
             return
 
         structure_name = caps.get_structure(0).get_name()
+        log.info("input pad-added caps=%s", caps.to_string())
         if not structure_name.startswith("video"):
             return
 
