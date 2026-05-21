@@ -157,16 +157,18 @@ class Factory(GstRtspServer.RTSPMediaFactory):
                 return
             frame = latest_frame.copy()
 
-        # 🔥 FIX: enforce FPS timing
-        time.sleep(1.0 / FPS)
+        frame = cv2.resize(frame, (W, H))
 
         data = frame.tobytes()
 
         buf = Gst.Buffer.new_allocate(None, len(data), None)
         buf.fill(0, data)
 
-        buf.duration = self.frame_duration
-        buf.pts = buf.dts = self.frame_id * self.frame_duration
+        duration = Gst.SECOND // FPS
+        buf.duration = duration
+
+        pts = self.frame_id * duration
+        buf.pts = buf.dts = pts
 
         self.frame_id += 1
 
