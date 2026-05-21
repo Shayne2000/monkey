@@ -541,6 +541,91 @@ def normalize_model_output(output) -> np.ndarray:
     return arr.astype(np.float32)
 
 
+def make_input_blob(image, size: int) -> np.ndarray:
+    resized = cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    blob = rgb.astype(np.float32) / 255.0
+    return np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
+
+
+def nms_indices(boxes: List[List[int]], confidences: List[float], threshold: float) -> List[int]:
+    if not boxes:
+        return []
+
+    boxes_np = np.asarray(boxes, dtype=np.float32)
+    scores = np.asarray(confidences, dtype=np.float32)
+    x1 = boxes_np[:, 0]
+    y1 = boxes_np[:, 1]
+    x2 = x1 + boxes_np[:, 2]
+    y2 = y1 + boxes_np[:, 3]
+    areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter_w = np.maximum(0.0, xx2 - xx1)
+        inter_h = np.maximum(0.0, yy2 - yy1)
+        inter = inter_w * inter_h
+        union = areas[i] + areas[order[1:]] - inter
+        iou = inter / np.maximum(union, 1e-12)
+        order = order[1:][iou <= threshold]
+
+    return keep
+
+
+class OnnxModelRunner:
+    def __init__(self, model_path: str, backend: str) -> None:
+        self.backend = backend
+        self.model_path = model_path
+        self.input_name = ""
+        if backend == "opencv":
+            self.net = cv2.dnn.readNetFromONNX(model_path)
+        elif backend == "onnxruntime":
+            import onnxruntime as ort
+
+            self.net = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+            self.input_name = self.net.get_inputs()[0].name
+        else:
+            raise ValueError(f"unsupported model backend: {backend}")
+
+    def forward(self, image, size: int):
+        blob = make_input_blob(image, size)
+        if self.backend == "opencv":
+            self.net.setInput(blob)
+            return self.net.forward()
+        return self.net.run(None, {self.input_name: blob})[0]
+
+
+def choose_model_backend(requested: str) -> str:
+    if requested in ("auto", "opencv"):
+        if hasattr(cv2, "dnn") and hasattr(cv2.dnn, "readNetFromONNX"):
+            return "opencv"
+        if requested == "opencv":
+            raise RuntimeError("OpenCV was requested, but this build has no cv2.dnn.readNetFromONNX")
+
+    if requested in ("auto", "onnxruntime"):
+        try:
+            import onnxruntime  # noqa: F401
+            return "onnxruntime"
+        except ImportError:
+            if requested == "onnxruntime":
+                raise RuntimeError("onnxruntime was requested, but it is not installed")
+
+    raise RuntimeError(
+        "no ONNX backend available; install onnxruntime, install OpenCV with DNN/ONNX support, "
+        "or run with --no-models"
+    )
+
+
 class VehicleModelPipeline:
     """Runs YOLO detection and brand classification only on motion crops."""
 
@@ -554,6 +639,7 @@ class VehicleModelPipeline:
         classifier_size: int,
         confidence: float,
         nms_threshold: float,
+        backend: str,
     ) -> None:
         self.yolo_labels = load_label_map(labels_path, "yolo")
         self.classifier_labels = load_label_map(labels_path, "classifier")
@@ -562,19 +648,15 @@ class VehicleModelPipeline:
         self.classifier_size = classifier_size
         self.confidence = confidence
         self.nms_threshold = nms_threshold
-        self.yolo = cv2.dnn.readNetFromONNX(yolo_model)
-        self.classifier = cv2.dnn.readNetFromONNX(classifier_model)
+        self.backend = choose_model_backend(backend)
+        self.yolo = OnnxModelRunner(yolo_model, self.backend)
+        self.classifier = OnnxModelRunner(classifier_model, self.backend)
         self._lock = threading.Lock()
 
     @classmethod
     def maybe_create(cls, args):
         if not args.enable_models:
             return None
-        if not hasattr(cv2, "dnn") or not hasattr(cv2.dnn, "readNetFromONNX"):
-            raise RuntimeError(
-                "this OpenCV build does not support cv2.dnn.readNetFromONNX; "
-                "run with --no-models for motion-only mode, or install an OpenCV build with DNN/ONNX support"
-            )
         missing = [
             path for path in (args.yolo_model, args.classifier_model, args.labels)
             if not os.path.exists(path)
@@ -589,6 +671,7 @@ class VehicleModelPipeline:
             classifier_size=args.classifier_size,
             confidence=args.model_confidence,
             nms_threshold=args.nms_threshold,
+            backend=args.model_backend,
         )
 
     def detect_and_classify(self, frame, motion_box: Tuple[int, int, int, int]) -> List[dict]:
@@ -618,16 +701,8 @@ class VehicleModelPipeline:
     def _detect_vehicles(self, crop) -> List[dict]:
         img_size = self.yolo_size
         height, width = crop.shape[:2]
-        blob = cv2.dnn.blobFromImage(
-            crop,
-            scalefactor=1.0 / 255.0,
-            size=(img_size, img_size),
-            swapRB=True,
-            crop=False,
-        )
         with self._lock:
-            self.yolo.setInput(blob)
-            output = self.yolo.forward()
+            output = self.yolo.forward(crop, img_size)
 
         rows = normalize_model_output(output)
         boxes = []
@@ -657,10 +732,9 @@ class VehicleModelPipeline:
             confidences.append(confidence)
             class_ids.append(label_id)
 
-        keep = cv2.dnn.NMSBoxes(boxes, confidences, self.confidence, self.nms_threshold)
-        if len(keep) == 0:
+        indices = nms_indices(boxes, confidences, self.nms_threshold)
+        if len(indices) == 0:
             return []
-        indices = np.array(keep).reshape(-1).tolist()
         return [
             {
                 "box": tuple(int(v) for v in boxes[i]),
@@ -681,16 +755,8 @@ class VehicleModelPipeline:
         if crop.size == 0:
             return None, None
         img_size = self.classifier_size
-        blob = cv2.dnn.blobFromImage(
-            crop,
-            scalefactor=1.0 / 255.0,
-            size=(img_size, img_size),
-            swapRB=True,
-            crop=False,
-        )
         with self._lock:
-            self.classifier.setInput(blob)
-            output = np.asarray(self.classifier.forward()).reshape(-1)
+            output = np.asarray(self.classifier.forward(crop, img_size)).reshape(-1)
         if output.size == 0:
             return None, None
         probs = output if 0.99 <= float(np.sum(output)) <= 1.01 else softmax(output)
@@ -1033,8 +1099,8 @@ def run_multi_camera(args) -> None:
     writer = JsonlWriter(args.event_log)
     model_pipeline = VehicleModelPipeline.maybe_create(args)
     if model_pipeline is not None:
-        log.info("model pipeline enabled: yolo=%s classifier=%s labels=%s",
-                 args.yolo_model, args.classifier_model, args.labels)
+        log.info("model pipeline enabled backend=%s yolo=%s classifier=%s labels=%s",
+                 model_pipeline.backend, args.yolo_model, args.classifier_model, args.labels)
     threads = []
 
     log.info("starting %d cameras", len(cameras))
@@ -1099,6 +1165,7 @@ def main() -> int:
     parser.add_argument("--classifier-size", type=int, default=224)
     parser.add_argument("--model-confidence", type=float, default=0.25)
     parser.add_argument("--nms-threshold", type=float, default=0.45)
+    parser.add_argument("--model-backend", choices=("auto", "opencv", "onnxruntime"), default="auto")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -1111,8 +1178,8 @@ def main() -> int:
         if args.single_camera:
             model_pipeline = VehicleModelPipeline.maybe_create(args)
             if model_pipeline is not None:
-                log.info("model pipeline enabled: yolo=%s classifier=%s labels=%s",
-                         args.yolo_model, args.classifier_model, args.labels)
+                log.info("model pipeline enabled backend=%s yolo=%s classifier=%s labels=%s",
+                         model_pipeline.backend, args.yolo_model, args.classifier_model, args.labels)
             camera_loop(
                 rtsp_url=args.input,
                 camera_id=args.camera_id,

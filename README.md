@@ -36,14 +36,21 @@ python3 scripts/check_models.py
 ```
 
 If Jetson OpenCV is old and prints `module 'cv2' has no attribute 'dnn'`,
-run motion logging first with:
+install a separate ONNX Runtime package if your Jetson/Python supports it:
+
+```bash
+python3 -m pip install --user onnxruntime
+python3 scripts/check_models.py --backend onnxruntime
+```
+
+If that does not install cleanly, run motion logging first with:
 
 ```bash
 python3 robust_rtsp_relay.py --no-models
 ```
 
-The model path needs OpenCV DNN/ONNX support or a later DeepStream `nvinfer`
-integration.
+The model path now supports OpenCV DNN or ONNX Runtime. A later DeepStream
+`nvinfer` integration is still the faster Jetson-native path.
 
 Run all 5 default cameras:
 
@@ -55,6 +62,12 @@ Run only one camera:
 
 ```bash
 python3 robust_rtsp_relay.py --single-camera --input rtsp://10.0.11.153:8554/cctv02 --camera-id cctv02
+```
+
+Force ONNX Runtime if OpenCV has no DNN module:
+
+```bash
+python3 robust_rtsp_relay.py --single-camera --input rtsp://10.0.11.153:8554/cctv02 --camera-id cctv02 --model-backend onnxruntime
 ```
 
 Disable model inference and log motion only:

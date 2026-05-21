@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quick ONNX/OpenCV DNN smoke test for the Jetson."""
+"""Quick ONNX smoke test for the Jetson."""
 
 import argparse
 import json
@@ -10,29 +10,52 @@ import cv2
 import numpy as np
 
 
+def choose_backend(requested):
+    if requested in ("auto", "opencv"):
+        if hasattr(cv2, "dnn") and hasattr(cv2.dnn, "readNetFromONNX"):
+            return "opencv"
+        if requested == "opencv":
+            raise RuntimeError("OpenCV was requested, but this build has no cv2.dnn.readNetFromONNX")
+
+    if requested in ("auto", "onnxruntime"):
+        try:
+            import onnxruntime  # noqa: F401
+            return "onnxruntime"
+        except ImportError:
+            if requested == "onnxruntime":
+                raise RuntimeError("onnxruntime was requested, but it is not installed")
+
+    raise RuntimeError(
+        "no ONNX backend available; install onnxruntime, install OpenCV with DNN/ONNX support, "
+        "or run robust_rtsp_relay.py --no-models"
+    )
+
+
 def load_labels(path):
     with open(path, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
-def run_forward(model_path, size):
-    if not hasattr(cv2, "dnn") or not hasattr(cv2.dnn, "readNetFromONNX"):
-        raise RuntimeError(
-            "this OpenCV build has no cv2.dnn.readNetFromONNX; "
-            "use robust_rtsp_relay.py --no-models or install OpenCV with DNN/ONNX support"
-        )
-    net = cv2.dnn.readNetFromONNX(model_path)
+def make_blob(image, size):
+    resized = cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    blob = rgb.astype(np.float32) / 255.0
+    return np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
+
+
+def run_forward(model_path, size, backend):
     image = np.zeros((size, size, 3), dtype=np.uint8)
-    blob = cv2.dnn.blobFromImage(
-        image,
-        scalefactor=1.0 / 255.0,
-        size=(size, size),
-        swapRB=True,
-        crop=False,
-    )
+    blob = make_blob(image, size)
     start = time.perf_counter()
-    net.setInput(blob)
-    output = net.forward()
+    if backend == "opencv":
+        net = cv2.dnn.readNetFromONNX(model_path)
+        net.setInput(blob)
+        output = net.forward()
+    else:
+        import onnxruntime as ort
+
+        net = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        output = net.run(None, {net.get_inputs()[0].name: blob})[0]
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     return np.asarray(output).shape, elapsed_ms
 
@@ -44,6 +67,7 @@ def main():
     parser.add_argument("--labels", default="models/labels.json")
     parser.add_argument("--yolo-size", type=int, default=640)
     parser.add_argument("--classifier-size", type=int, default=224)
+    parser.add_argument("--backend", choices=("auto", "opencv", "onnxruntime"), default="auto")
     args = parser.parse_args()
 
     print("cv2:", cv2.__version__)
@@ -53,11 +77,13 @@ def main():
     labels = load_labels(args.labels)
     print("yolo labels:", labels.get("yolo", {}))
     print("classifier labels:", labels.get("classifier", {}))
+    backend = choose_backend(args.backend)
+    print("backend:", backend)
 
-    yolo_shape, yolo_ms = run_forward(args.yolo_model, args.yolo_size)
+    yolo_shape, yolo_ms = run_forward(args.yolo_model, args.yolo_size, backend)
     print(f"YOLO forward shape={yolo_shape} elapsed_ms={yolo_ms:.1f}")
 
-    cls_shape, cls_ms = run_forward(args.classifier_model, args.classifier_size)
+    cls_shape, cls_ms = run_forward(args.classifier_model, args.classifier_size, backend)
     print(f"Classifier forward shape={cls_shape} elapsed_ms={cls_ms:.1f}")
 
 
