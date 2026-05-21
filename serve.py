@@ -144,6 +144,8 @@ class Factory(GstRtspServer.RTSPMediaFactory):
             "h264parse ! rtph264pay name=pay0 pt=96 config-interval=1"
         )
 
+        print('test2')
+
         self.frame_id = 0
 
     def do_create_element(self, url):
@@ -189,11 +191,13 @@ if __name__ == "__main__":
 
     server = GstRtspServer.RTSPServer()
     server.set_service(rtsp_port)
-    print()
+    print("push frame3")
 
     factory = Factory()
     server.get_mount_points().add_factory(rtsp_mount, factory)
     server.attach(None)
+
+    print('test')
 
     print(f"RTSP: rtsp://<JETSON_IP>:{rtsp_port}{rtsp_mount}")
 
