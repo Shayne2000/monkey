@@ -85,7 +85,7 @@ class GstFrameReader:
                 if ret == Gst.StateChangeReturn.FAILURE:
                     raise RuntimeError("set_state(PLAYING) failed")
                 self._start_loop()
-                if not self.wait_for_first_frame(timeout_s=8.0):
+                if not self.wait_for_first_frame(timeout_s=5.0):
                     raise RuntimeError("pipeline reached PLAYING but produced no frames")
                 log.info("input RTSP connected via %s", label)
                 return True
@@ -156,7 +156,7 @@ class GstFrameReader:
 
     def _h264_decoder_candidates(self) -> List[str]:
         candidates = []
-        for decoder in ("nvv4l2decoder", "omxh264dec", "avdec_h264"):
+        for decoder in ("omxh264dec", "nvv4l2decoder", "avdec_h264"):
             if gst_element_exists(decoder):
                 candidates.append(decoder)
         return candidates
@@ -171,10 +171,10 @@ class GstFrameReader:
 
     def _converter_candidates(self) -> List[str]:
         candidates = []
-        if gst_element_exists("nvvideoconvert"):
-            candidates.append("nvvideoconvert")
         if gst_element_exists("nvvidconv"):
             candidates.append("nvvidconv")
+        if gst_element_exists("nvvideoconvert"):
+            candidates.append("nvvideoconvert")
         candidates.append("videoconvert")
         return candidates
 
