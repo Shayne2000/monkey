@@ -12,7 +12,7 @@ from gi.repository import Gst, GstRtspServer, GLib
 # =============================
 # CONFIG
 # =============================
-rtsp_in = "rtsp://10.0.11.153:8554/cctv09"
+rtsp_in = "rtsp://10.0.11.153:8554/cctv1"
 rtsp_port = "8554"
 rtsp_mount = "/jetson"
 
