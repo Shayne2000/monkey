@@ -99,6 +99,9 @@ Run primary YOLO detection for one camera:
 /usr/bin/python3 deepstream_vehicle_log.py --single-camera --input rtsp://10.0.11.153:8554/cctv02 --camera-id cctv02
 ```
 
+The default DeepStream inference size is `416` because the current YOLO ONNX
+file reports a fixed 416x416 input to TensorRT.
+
 Run the default 5 cameras:
 
 ```bash

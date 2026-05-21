@@ -381,7 +381,7 @@ def parse_args():
     parser.add_argument("--mux-width", type=int, default=640)
     parser.add_argument("--mux-height", type=int, default=360)
     parser.add_argument("--mux-timeout-usec", type=int, default=40000)
-    parser.add_argument("--infer-size", type=int, default=640)
+    parser.add_argument("--infer-size", type=int, default=416)
     parser.add_argument("--infer-interval", type=int, default=1)
     parser.add_argument("--confidence", type=float, default=0.35)
     parser.add_argument("--nms-iou-threshold", type=float, default=0.45)
