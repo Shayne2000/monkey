@@ -17,7 +17,7 @@ rtsp_port = "8554"
 rtsp_mount = "/jetson"
 
 W, H = 480, 270
-FPS = 20
+FPS = 15
 process_interval = 1.0 / FPS
 
 # =============================
@@ -30,15 +30,12 @@ frame_lock = threading.Lock()
 # NVDEC INPUT
 # =============================
 def build_input(url):
-    pipeline = (
-        "rtspsrc location=" + url + " latency=0 drop-on-latency=true ! "
-        "rtph264depay ! h264parse ! "
-        "nvv4l2decoder ! "
-        "nvvidconv ! video/x-raw,format=BGRx ! "
-        "videoconvert ! "
-        "appsink drop=1 sync=false"
+    return (
+        "rtspsrc location=" + url + " protocols=tcp latency=200 ! "
+        "rtph264depay ! h264parse ! avdec_h264 ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "appsink drop=1 sync=false max-buffers=1"
     )
-    return pipeline
 
 # =============================
 # MERGE BOX
@@ -74,9 +71,12 @@ def adaptive_merge(boxes, dist_th=180):
 def camera_loop():
     global latest_frame
 
-    print("push frame")
+    def open_cap():
+        cap = cv2.VideoCapture(build_input(rtsp_in), cv2.CAP_GSTREAMER)
+        time.sleep(1)
+        return cap
 
-    cap = cv2.VideoCapture(build_input(rtsp_in), cv2.CAP_GSTREAMER)
+    cap = open_cap()
 
     prev = None
     last = 0
@@ -84,23 +84,22 @@ def camera_loop():
 
     print("[INFO] Camera started")
 
-    print("check point weired")
-
     while True:
-        print("in while true")
+
         ret, frame = cap.read()
-        if not ret:
+
+        if not ret or frame is None:
+            print("[WARN] reconnect RTSP")
+            cap.release()
             time.sleep(1)
-            print("THIS")
-            cap = cv2.VideoCapture(build_input(rtsp_in), cv2.CAP_GSTREAMER)
+            cap = open_cap()
             continue
-        
-        print("pass1")
+
         now = time.perf_counter()
         if now - last < process_interval:
             continue
         last = now
-        print("pass2")
+
         frame = cv2.resize(frame, (W, H))
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -114,20 +113,19 @@ def camera_loop():
             contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             boxes = []
-            for c in contours[:10]:
+            for c in contours:
                 if cv2.contourArea(c) < 1000:
                     continue
                 x, y, w, h = cv2.boundingRect(c)
                 boxes.append((x, y, w, h))
 
             merged = adaptive_merge(boxes)
-        print("pass3")
+
         prev = gray
 
         for x, y, w, h in merged:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        print("hello??")
         with frame_lock:
             latest_frame = frame
 
