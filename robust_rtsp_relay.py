@@ -518,6 +518,7 @@ def detect_motion_regions(
     merge_distance: float,
     motion_width: int,
     blur_kernel: int,
+    crop_expand: float,
 ):
     original_h, original_w = frame.shape[:2]
     scale = 1.0
@@ -556,7 +557,10 @@ def detect_motion_regions(
 
     merged = adaptive_merge_boxes(candidate_boxes, merge_distance * scale)
     if scale == 1.0:
-        return gray, merged
+        return gray, [
+            expand_box_to_square(box, original_w, original_h, crop_expand)
+            for box in merged
+        ]
 
     scaled_boxes = []
     inv_scale = 1.0 / scale
@@ -571,7 +575,45 @@ def detect_motion_regions(
         y2 = max(y1 + 1, min(y2, original_h))
         scaled_boxes.append((x1, y1, x2 - x1, y2 - y1))
 
-    return gray, scaled_boxes
+    return gray, [
+        expand_box_to_square(box, original_w, original_h, crop_expand)
+        for box in scaled_boxes
+    ]
+
+
+def expand_box_to_square(
+    box: Tuple[int, int, int, int],
+    image_width: int,
+    image_height: int,
+    expand: float,
+) -> Tuple[int, int, int, int]:
+    x, y, w, h = box
+    cx = x + w / 2.0
+    cy = y + h / 2.0
+    side = max(w, h) * max(expand, 1.0)
+    side = max(side, 16.0)
+
+    x1 = int(round(cx - side / 2.0))
+    y1 = int(round(cy - side / 2.0))
+    x2 = int(round(cx + side / 2.0))
+    y2 = int(round(cy + side / 2.0))
+
+    if x1 < 0:
+        x2 -= x1
+        x1 = 0
+    if y1 < 0:
+        y2 -= y1
+        y1 = 0
+    if x2 > image_width:
+        shift = x2 - image_width
+        x1 = max(0, x1 - shift)
+        x2 = image_width
+    if y2 > image_height:
+        shift = y2 - image_height
+        y1 = max(0, y1 - shift)
+        y2 = image_height
+
+    return (x1, y1, max(1, x2 - x1), max(1, y2 - y1))
 
 
 def build_vehicle_log_event(
@@ -616,6 +658,7 @@ def camera_loop(
     merge_distance: float,
     motion_width: int,
     blur_kernel: int,
+    crop_expand: float,
     display: bool,
     display_width: int,
     display_fps: float,
@@ -709,6 +752,7 @@ def camera_loop(
                     merge_distance=merge_distance,
                     motion_width=motion_width,
                     blur_kernel=blur_kernel,
+                    crop_expand=crop_expand,
                 )
                 motion_ms = (time.monotonic() - motion_start) * 1000.0
                 last_boxes = boxes
@@ -806,11 +850,12 @@ def main() -> int:
     parser.add_argument("--input-height", type=int, default=360)
     parser.add_argument("--event-log", default="vehicle_log.jsonl")
     parser.add_argument("--process-every-n", type=int, default=2)
-    parser.add_argument("--min-area", type=float, default=1000.0)
-    parser.add_argument("--density-threshold", type=float, default=0.35)
+    parser.add_argument("--min-area", type=float, default=500.0)
+    parser.add_argument("--density-threshold", type=float, default=0.20)
     parser.add_argument("--merge-distance", type=float, default=350.0)
     parser.add_argument("--motion-width", type=int, default=480)
     parser.add_argument("--blur-kernel", type=int, default=5)
+    parser.add_argument("--crop-expand", type=float, default=1.8)
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--display-width", type=int, default=960)
     parser.add_argument("--display-fps", type=float, default=10.0)
@@ -836,6 +881,7 @@ def main() -> int:
             merge_distance=args.merge_distance,
             motion_width=args.motion_width,
             blur_kernel=args.blur_kernel,
+            crop_expand=args.crop_expand,
             display=args.display,
             display_width=args.display_width,
             display_fps=args.display_fps,
